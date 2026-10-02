@@ -1,16 +1,19 @@
 # Language-Agent
 
-A tracked chat space for learning **Japanese**. Open a terminal, talk, and the
+A tracked chat space for learning a language — Japanese, Chinese, Korean, French,
+German, Spanish, Italian or Portuguese, one at a time. Open a terminal, talk, and the
 conversation stays inside the vocabulary you have actually been taught — then what you
 knew, hesitated on, and met for the first time gets recorded.
 
 The shape of the whole thing: **connections form the Lexicon; the project uses the
-Lexicon.** Duolingo units, JLPT lists, song lyrics, anime subtitles are all the same job
-— read a source, emit words, merge. Nothing downstream needs to know where a word came
-from.
+Lexicon.** Duolingo units, Anki decks, test lists, song lyrics, anime subtitles are all
+the same job — read a source, emit words, merge. Nothing downstream needs to know where a
+word came from, and nothing downstream hardcodes a language: the active one is
+`language` in `Profile/profile.json`, and `languages.json` says what that means.
 
 ```
-Connections/<name>  ──fetch──>  raw tables  ──build_lexicon──>  Profile/lexicon.jsonl  ──>  /chat
+Connections/<name>  ──fetch──>  raw tables  ──build_lexicon──>  Profile/<code>/lexicon.jsonl  ──>  /chat
+Resources/<kind>    ──fetch──>  ref tables  ──┘
 ```
 
 The Lexicon lives under `Profile/` because it is **yours, not a source**. Connections are
@@ -19,20 +22,26 @@ else and can never be re-fetched.
 
 ## First run
 
-- `/setup` once — asks for the Duolingo username, fetches everything, builds the lexicon.
+- `/setup` once — asks for the Duolingo username (and, optionally, an Anki deck), takes
+  the language from the active Duolingo course, fetches everything, builds the lexicon.
+  It asks for the language only when Duolingo cannot say.
 - `/chat` daily — the conversation itself.
-- `/sync` after studying on Duolingo — pulls new units, unlocks their words.
+- `/sync` after studying on Duolingo or Anki — pulls new units and reviews, unlocks their words.
 - `/quiz` to be tested on what has been unlocked.
-- `python setup.py --check` when confused — what is present, missing or stale; no network.
+- `/switch <language>` to practise another language; `/connect` to add a source later.
+- `python setup.py --check` when confused — the language, then what is present, missing
+  or stale; no network.
 
 ## Layout
 
 ```
-Connections/     YOUR accounts — things that know who you are. Only Duolingo so far.
+languages.json   the registry: every language the project can build, and how
+setup.py         one command from nothing to a lexicon; what the skills call
+Connections/     YOUR accounts — things that know who you are. Duolingo, Anki.
 Resources/       reference material that is the same for everyone: Tests, Dictionary
-Profile/         you — lexicon.jsonl, names.jsonl, profile.json, and the build scripts
+Profile/         you — profile.json, one <code>/ folder per language, and the build scripts
 Chats/           chat transcripts, one file per session
-showcase.html    generated browsable view of everything (see below)
+showcase.html    generated browsable view of the active language (see below)
 .claude/skills/  the skills
 _references/     cloned prior art — NOT part of this project, never import from it
 ```
@@ -45,14 +54,85 @@ upstream project publishes. Both feed the lexicon the same way.
 
 | Skill | What it does |
 |---|---|
-| `/setup` | First run: username, fetch, build; safe to re-run |
-| `/chat` | Japanese conversation restricted to your lexicon; logs a transcript and updates confidence |
+| `/setup` | First run: sources, language, fetch, build; safe to re-run |
+| `/chat` | Conversation in the active language restricted to your lexicon; logs a transcript and updates confidence |
 | `/quiz` | Forced-choice questions over the words you have been taught; records right and wrong |
-| `/sync` | Daily refresh after Duolingo: `setup.py --sync`, reports newly unlocked words |
+| `/sync` | Daily refresh: `setup.py --sync` (Duolingo, and Anki if connected), reports newly unlocked words |
+| `/connect` | `anki <path>` or `duolingo <username>` — add a source after setup |
+| `/switch` | Change the active language; the previous one's evidence stays in its own folder |
+
+## Languages
+
+`languages.json` at the root is the registry, and the only place a language is defined.
+One entry per code:
+
+```json
+"fr": {"name": "French", "plugin": "latin", "duolingo": "fr", "scripts": ["latin"],
+       "tests": {"source": null, "levels": ["A1", "A2", "B1", "B2", "C1", "C2"], "official": false},
+       "dictionary": {"source": null}}
+```
+
+- `name` — used for folder names (`Resources/Tests/French/`, `.../English/french.csv`)
+  and everything shown to the learner.
+- `plugin` — a module in `Profile/data/scripts/languages/` (below).
+- `duolingo` — duome's course code, which is not always the ISO one.
+- `scripts` — the writing systems a word's `script` field may take.
+- `tests.source` / `dictionary.source` — the fetcher to run under
+  `Resources/*/data/fetch/fetch-<source>.py`, or `null` when none exists yet; setup.py
+  skips a `null` step rather than failing. `tests.levels` run **easiest first**;
+  `tests.official` is false where the levels are CEFR-labelled frequency bands rather
+  than an exam list.
+
+**Choosing the language.** `setup.py --language <code>` writes it. Without the flag the
+saved one is used; without a saved one, the active Duolingo course decides it after the
+profile fetch, and a course the registry does not list exits 2 with the supported codes.
+A *different* Duolingo account decides it again. `/setup` asks only when none of that can
+work — no Duolingo at all, or an unsupported course — and then once.
+
+**Plugins** hold everything language-specific about matching, so `build_lexicon.py` and
+`lexicon.py` stay generic. Each exposes `LANGUAGE` with `script_of`, `tokens` (composite
+splitting; `[]` = never split), `is_content` (false for bare particles/articles),
+`lemmas` (guarded inflection reduction), `weight` (information content for `contains`),
+`reading_label` (what `vocab --compact` shows in brackets), `name_rating` and
+`normalise`. `japanese.py` is the original logic; `latin.py` covers fr/de/es/it/pt with a
+short guarded suffix table per language; `chinese.py` splits on characters; `korean.py`
+strips particles only inside `lemmas`, never as a word on its own.
+
+**Per-language Profile.** Switching must never lose evidence, so learner data lives under
+the language's code:
+
+```
+Profile/
+  profile.json          {"language": "ja", "connections": {...}, "lexicon": {...}} — active language
+  ja/lexicon.jsonl      Japanese words and your evidence about them
+  ja/names.jsonl
+  fr/lexicon.jsonl      ...appears on the first French build
+```
+
+`/switch` only rewrites `language`; `ja/` is left exactly as it was and is picked up again
+on the way back. The pre-registry layout kept `lexicon.jsonl` flat in `Profile/`;
+`build_lexicon.py` moves it into `Profile/ja/` the first time it runs. `LEXICON_DIR`
+replaces `Profile/` as a whole for tests and dry runs; the `<code>/` folder still applies
+under it.
+
+**Adding a language** is a registry entry plus, if no existing plugin fits, a plugin.
+Fetchers are optional — a language with `null` sources still works from Duolingo or Anki,
+it just has no `listed` words and every level is inferred.
 
 ## Connections
 
-Each connection folder holds its artifacts at the root and its code under `data/`.
+Each connection folder holds its artifacts at the root and its code under `data/`, and
+writes one word table per language it knows about:
+
+```
+Connections/<Name>/data/languages/<FromLanguage>/<language>.csv
+unit, unit_name, unit_topic, position, word, reading, gloss, script, repeat_units, audio, seen
+```
+
+`build_lexicon.py` merges every connection's table for the active language; the folder
+name becomes the `sources` tag. `unit` gates a word by course position (Duolingo); `seen`
+is `1`/`0` for connections that know per card whether you have met it (Anki) and can
+only ever promote `unseen` → `exposed`.
 
 ### `Connections/Duolingo/`
 
@@ -67,6 +147,7 @@ python refresh-user-profile.py       # make duome re-pull from Duolingo — DO T
 python fetch-user-data.py            # account facts + course registry -> profile.json, profile.png
 python fetch-progress.py             # unit tree -> progress.json, and back-fills the course entry
 python fetch-word-lists.py en ja     # course lexicon -> data/languages/English/japanese.csv
+python fetch-word-lists.py en fr     # any course duome serves: -> English/french.csv
 ```
 
 ```
@@ -78,7 +159,7 @@ Connections/Duolingo/
   progress.json         the unit tree for the active course
   data/fetch/           the scrapers
   data/languages/       course data, grouped by the language you learn FROM
-    English/japanese.csv
+    English/japanese.csv  English/french.csv  ...
 ```
 
 The stat icons are **CSS background images on class names**, not `<img>` tags, so they
@@ -94,22 +175,50 @@ one also gets `through_unit`, `units_completed`, `units_total` and the path to i
 table. **Only the active course gets a tree** — duome renders the unit grid for whichever
 course Duolingo currently considers active, so inactive ones stay summary-only with
 `through_unit: null`. To get a tree for another language, switch course in Duolingo,
-then refresh.
+then refresh. Course codes are duome's, which is why the registry carries a `duolingo`
+field: duome calls Mandarin `zs`, not `zh`.
 
 `refresh-user-profile.py` posts to duome's `/aggiorna.php` with your numeric Duolingo id
 (read off the avatar URL). Without it duome serves whatever it last cached, which can be
 months stale and shows **every unit as uncompleted** — silently wrong rather than
 obviously broken, so never skip it.
 
-`japanese.csv` is the full table: one row per word, `unit` being the unit that first
+Each `<language>.csv` is the full table: one row per word, `unit` being the unit that first
 introduces it, `repeat_units` the later ones that revisit it. That column is the whole
 trick — "which words do I have" becomes one comparison, no per-word tracking needed.
 
+### `Connections/Anki/`
+
+An exported deck (`.apkg`, File → Export → *Anki Deck Package*) or a live
+`collection.anki2`. No units: a card with at least one review is `seen=1`, the rest `0`.
+
+```bash
+python setup.py --anki ~/deck.apkg [--deck "French::Core"]      # read it, then build
+python Connections/Anki/data/fetch/fetch-anki.py deck.apkg --list            # which decks are in it
+python Connections/Anki/data/fetch/fetch-anki.py deck.apkg --field-word 2 --field-gloss 4
+```
+
+It reads the **active** language and writes `data/languages/English/<language>.csv`;
+fields default to 1 = word, 2 = gloss, and the guess is printed per note type so a wrong
+one is obvious. `Connections/Anki/profile.json` records the file, deck and field mapping
+per course (`en-<code>`), which is what lets `setup.py --sync` re-read the deck without
+being told again — and only for the language it was read into.
+
 ## Resources
 
-Reference material, identical for every learner. Same folder shape as a connection.
+Reference material, identical for every learner. Same folder shape as a connection, one
+folder per language name:
 
-### `Resources/Tests/`
+```
+Resources/Tests/<Language>/<source>-<level>.csv      level, expression, reading, meaning, tags
+Resources/Dictionary/<Language>/<source>.csv         headword, reading, forms, readings, pos, senses, common
+```
+
+Fetchers take no language argument — the source implies it — and `setup.py` runs the
+ones the registry names. Where `tests.official` is false the levels are frequency bands
+(`tags` carries `frequency-band`): a difficulty signal, not an exam.
+
+### Japanese: `Resources/Tests/` (JLPT)
 
 Standardised exam vocabulary, for measuring coverage against a syllabus rather than
 against a course.
@@ -128,7 +237,7 @@ pre-2010 lists plus past-paper analysis. Source is
 [open-anki-jlpt-decks](https://github.com/jamsinclair/open-anki-jlpt-decks), itself
 derived from tanos.co.uk. Good enough to measure against; not a syllabus.
 
-### `Resources/Dictionary/`
+### Japanese: `Resources/Dictionary/` (JMdict)
 
 JMdict, the standard open Japanese–English dictionary. This resource exists because
 Duolingo gives a surface form and a gloss and nothing else — for kanji-only entries
@@ -139,27 +248,28 @@ python Resources/Dictionary/data/fetch/fetch-jmdict.py          # ~22k common wo
 python Resources/Dictionary/data/fetch/fetch-jmdict.py --full   # ~200k, rarely needed
 ```
 
-Writes `Japanese/jmdict.csv` with `kanji`, `kana`, `kanji_all`, `kana_all`, `pos`,
-`senses`, `common`. Because each entry groups every spelling of one word, it doubles as a
-**variant table**: look up たべもの and get 食べ物, which is the form the JLPT lists carry.
-The "common" subset is used deliberately — the full file is mostly archaic vocabulary no
-beginner course will ever surface.
+Writes `Japanese/jmdict.csv` in the generic dictionary schema: the kanji form is
+`headword` (kana when there is none), the kana is `reading`, and every other spelling and
+reading goes to `forms` / `readings`. Because each entry groups every spelling of one
+word, it doubles as a **variant table**: look up たべもの and get 食べ物, which is the form
+the JLPT lists carry. The "common" subset is used deliberately — the full file is mostly
+archaic vocabulary no beginner course will ever surface.
 
 The release filename carries a version and build timestamp, so `fetch-jmdict.py`
 discovers the asset through the GitHub releases API rather than hardcoding a URL.
 
-## The Lexicon (`Profile/`)
+## The Lexicon (`Profile/<code>/`)
 
-The merged word store, and the only thing `/chat` reads. It sits under `Profile/`, not
-`Connections/`, because it is **yours** — connections are regenerable, this holds
-evidence about you that can never be re-fetched.
+The merged word store for the active language, and the only thing `/chat` reads. It sits
+under `Profile/`, not `Connections/`, because it is **yours** — connections are
+regenerable, this holds evidence about you that can never be re-fetched.
 
 ```bash
 cd Profile/data/scripts
-python build_lexicon.py                  # merge connection tables -> lexicon.jsonl
+python build_lexicon.py                  # merge connection tables -> <code>/lexicon.jsonl
 
 python lexicon.py stats                  # coverage, confidence, course position
-python lexicon.py tests                  # coverage against the JLPT levels
+python lexicon.py tests                  # coverage against the language's test levels
 python lexicon.py vocab --compact        # the allow-list, prompt-ready
 python lexicon.py mark 食べる known        # record what a session revealed (any spelling)
 python lexicon.py look たべる             # full record for a word (any spelling)
@@ -169,14 +279,16 @@ python lexicon.py review --compact       # words the review schedule says are du
 python lexicon.py set-unit 20            # manual position override
 ```
 
-Skills talk to the lexicon through `lexicon.py`, never by reading `lexicon.jsonl`
-directly — it's 10,672 records and won't fit in a prompt. `LEXICON_DIR=<dir>` points
-every command at a copy of `lexicon.jsonl`/`names.jsonl`/`profile.json` (tests, dry
-runs), and `LEXICON_TODAY=YYYY-MM-DD` fakes the date for scheduling.
+Every command works on the active language. Skills talk to the lexicon through
+`lexicon.py`, never by reading `lexicon.jsonl` directly — Japanese alone is 10,672
+records and won't fit in a prompt. `LEXICON_DIR=<dir>` points every command at a copy
+(tests, dry runs), and `LEXICON_TODAY=YYYY-MM-DD` fakes the date for scheduling.
 
-- **Structural words** (particles, copula, さん: は が を に の か も です …) are never
-  quizzed or used as distractors, and `vocab --compact` puts them on one trailing line.
-- **`mark` resolves** a word by its record key, kanji form, kana reading or any variant.
+- **Structural words** — the language's particles, articles and copula (Japanese: は が
+  を に の か も です, さん …) — are never quizzed or used as distractors, and
+  `vocab --compact` puts them on one trailing line, which `/chat` treats as allowed.
+- **`mark` resolves** a word by its record key, any written form, its reading or any
+  variant (Japanese: kanji form or kana reading).
   Unmatched and ambiguous words are reported in the output, not fatal; the rest is
   applied in one save. Where a spelling is shared (分 = ふん/ぶん) the key is `分[ふん]`.
 - **`srs` is a Leitner schedule**, `{"box": 1-6, "due": date, "last": date}`, null until
@@ -186,6 +298,45 @@ runs), and `LEXICON_TODAY=YYYY-MM-DD` fakes the date for scheduling.
   then the least-tested exposed, then known.
 
 ### What is in it
+
+The **union** of every connection's words and the language's test words, deduplicated on
+the dictionary entry they resolve to (or on the normalised spelling where there is no
+dictionary). Proper nouns go to `names.jsonl` instead, so "use words you know" never
+means reciting place names.
+
+Fields, in record order:
+
+| Identity | Grading | Provenance | Yours |
+|---|---|---|---|
+| `word`, reading fields, `gloss`, `hints`, `pos`, `script`, `variants` | `listed`, `rating`, `rating_source`, `matched` | `sources`, `unit`, `unit_name`, `unit_topic`, `audio` | `confidence`, `seen_count`, `first_seen`, `last_seen`, `srs` |
+
+The reading fields are what the plugin fills — Japanese has `kana`, `kanji`, `romaji`.
+
+Everything except the last column is rebuilt from the connections and resources on every
+run. Learner evidence is never overwritten — that rule is what makes it safe to
+re-scrape daily.
+
+### Grading: `listed` and `rating` are separate
+
+- **`listed`** (bool) — is this exact word actually in the language's test list? Only
+  this number means anything for exam readiness. (It was called `jlpt` before the
+  registry; `look` may still show the old name.)
+- **`rating`** — how hard is it, listed or not: `len(levels) − index`, so the easiest
+  level scores highest. 5 = N5 for Japanese's five levels; 6 = HSK1 / TOPIK1 / A1 for a
+  six-level language.
+
+コーヒー is `listed: true, rating: 5`. アイスコーヒー is `listed: false, rating: 5` — not
+listed, but it contains コーヒー and cannot be harder than its parts. Keeping them apart
+means every word gets a usable difficulty without inflating exam coverage. A language
+with no test list yet has `listed: false` everywhere and every rating inferred.
+
+## Japanese grading notes (the `japanese` plugin)
+
+Everything below was measured on the Japanese build — Duolingo's Japanese course, the
+JLPT lists and JMdict. The tiers are generic; the guards and examples are the
+`japanese` plugin's, and are still true for it.
+
+### What is in it, for Japanese
 
 The **union** of the Duolingo course words and the JLPT test words, deduplicated on the
 JMdict entry they resolve to — so おちゃ and お茶 are one record with
@@ -197,16 +348,6 @@ leaving them in would let "use words you know" mean reciting place names. They s
 the Duolingo wordlist and get their own view in the showcase. A word counts as a name
 when every token of every gloss is capitalised — with demonyms excluded, since
 "Japanese" is ordinary vocabulary.
-
-Fields, in record order:
-
-| Identity | Grading | Provenance | Yours |
-|---|---|---|---|
-| `word`, `kana`, `kanji`, `romaji`, `gloss`, `hints`, `pos`, `script`, `variants` | `jlpt`, `rating`, `rating_source`, `matched` | `sources`, `unit`, `unit_name`, `unit_topic`, `audio` | `confidence`, `seen_count`, `first_seen`, `last_seen`, `srs` |
-
-Everything except the last column is rebuilt from the connections and resources on every
-run. Learner evidence is never overwritten — that rule is what makes it safe to
-re-scrape daily.
 
 **`gloss` is cleaned against the resolved entry; `hints` keeps the raw list.** Duolingo's
 gloss is the union of every hint duome showed for the token in any sentence, so
@@ -243,20 +384,12 @@ rows that are forms of the resolved entry was tried: it fixes かじ → 家事,
 Current fill: **100%** rated, 84% with a kana reading, 8,799 with a kanji form, 7,531
 with spelling variants.
 
-### Grading: `jlpt` and `rating` are separate
-
-- **`jlpt`** (bool) — is this exact word actually in a JLPT list? Only this number means
-  anything for exam readiness.
-- **`rating`** (1–5, 5 = N5 easiest) — how hard is it, listed or not.
-
-コーヒー is `jlpt: true, rating: 5`. アイスコーヒー is `jlpt: false, rating: 5` — not
-listed, but it contains コーヒー and cannot be harder than its parts. Keeping them apart
-means every word gets a usable difficulty without inflating exam coverage.
+### Tiers
 
 `rating_source` records which tier decided it. The first four mean "this is the listed
 word"; the rest mean "not listed, but here is a defensible difficulty".
 
-| Tier | `jlpt` | Rule | Count | Example |
+| Tier | `listed` | Rule | Count | Example |
 |---|---|---|---|---|
 | `expression` | ✅ | written exactly as the list has it | 7,145 | こんにちは |
 | `reading` | ✅ | the kana reading of a kanji entry | 644 | おちゃ → お茶 |
@@ -365,14 +498,18 @@ all, and whether JMdict gives it a kanji form that would decompose.
 python Profile/data/scripts/build_showcase.py --open
 ```
 
-Writes `showcase.html` at the root. Two sections:
+Writes `showcase.html` at the root, for the **active language** only, labelled from the
+registry (its name, level names, scripts). Two sections:
 
 - **Profile** — a card per connection: avatar with league badge, stat tiles using the
   scraped icons, league standing and account history, and a chip per course with a
   progress bar for the active one.
 - **Connections** — one panel each: *Profile* (the Lexicon, marked as yours rather than a
-  source), *Duolingo* (Japanese Wordlist), and *Tests* (Japanese JLPT N5…N1). Picking a
-  chip loads it into the table below.
+  source), *Duolingo* and *Anki* (that language's wordlist), and *Tests* (e.g. Japanese
+  JLPT N5…N1, easiest first). Picking a chip loads it into the table below.
+
+Columns a language never fills are dropped — no Kanji column for French, no Audio for an
+Anki deck — and Japanese keeps its Kana/Kanji/Rōmaji labels.
 
 Tables are generic — each dataset declares its own columns, which facet filters it wants,
 and whether it has a lock column. Sort on any column, free-text search, and a play button
@@ -384,7 +521,8 @@ the avatar embedded as a data URI. That keeps it a single double-clickable file 
 server, at the cost of needing a rebuild after new data. Re-run it after
 `build_lexicon.py`. Audio is the only thing fetched live, from Duolingo's CDN.
 
-**Confidence ladder:** `unseen` → `exposed` (the course taught it) → `shaky` (hesitated
+**Confidence ladder:** `unseen` → `exposed` (a course taught it, or you reviewed the
+Anki card) → `shaky` (hesitated
 or got it wrong) → `known` (used unprompted). Only the last three are usable in chat.
 
 ## Working notes
@@ -396,6 +534,8 @@ or got it wrong) → `known` (used unprompted). Only the last three are usable i
 - Two course spellings of one word (おちゃ unit 1, お茶 unit 66) merge into one record, and
   the **earliest** unit wins; every other unit goes to `repeat_units`. Last-row-wins put
   607 of 609 merged words at their later unit and locked おちゃ out of chat.
+- The language comes from `Profile/profile.json` and nowhere else — never from a path,
+  a filename or a CSV. Switching it never moves or deletes a `Profile/<code>/` folder.
 - Course position lives on the course entry in the connection's `profile.json`.
   `Profile/profile.json` mirrors it per connection for the learner's own view; the
   connection is the authority.

@@ -1,34 +1,50 @@
 #!/usr/bin/env python3
-"""Build Profile/lexicon.jsonl from the connections and resources.
+"""Build Profile/<code>/lexicon.jsonl from the connections and resources.
 
-    Connections/  what YOU did          -> Duolingo course words, in course order
-    Resources/    reference material    -> JLPT test lists, JMdict dictionary
+    Connections/  what YOU did          -> course words / cards, per connection
+    Resources/    reference material    -> test lists, dictionary
     Profile/      what the lexicon is   -> the merged word store, plus your evidence
 
-The lexicon is the union of the course words and the test words, deduplicated on the
-dictionary entry they resolve to (so おちゃ and お茶 are one record, not two). JMdict
-fills in whatever the other two leave blank -- readings above all, since Duolingo gives
-none at all for kanji-only entries.
+The active language is Profile/profile.json["language"], a key of languages.json
+(missing -> "ja", written back). Everything language-specific -- scripts, splitting,
+inflection, weights -- comes from the plugin the registry names, in languages/.
+
+The lexicon is the union of every connection's words and the test words, deduplicated on
+the dictionary entry they resolve to (so おちゃ and お茶 are one record, not two). The
+dictionary fills in whatever the others leave blank -- readings above all, since
+Duolingo gives none at all for kanji-only entries.
 
 Two grading fields, deliberately separate:
 
-    jlpt    bool -- is this exact word actually in a test list?
-    rating  1-5  -- how hard is it, 5 being N5 (easiest) and 1 being N1
+    listed  bool -- is this exact word actually in a test list?
+    rating  1..n -- how hard is it: len(levels) - index, so the easiest level is highest
+                    (Japanese: 5 = N5 .. 1 = N1; CEFR: 6 = A1 .. 1 = C2)
 
-コーヒー is `jlpt: true, rating: 5` because it is listed. アイスコーヒー is
-`jlpt: false, rating: 5` -- not listed, but it contains コーヒー and cannot be harder
+コーヒー is `listed: true, rating: 5` because it is listed. アイスコーヒー is
+`listed: false, rating: 5` -- not listed, but it contains コーヒー and cannot be harder
 than its parts. Keeping the two apart means exam coverage stays honest while every word
 still gets a usable difficulty.
 
-Proper nouns go to Profile/names.jsonl instead. たなか and トロント are not vocabulary,
-and leaving them in the lexicon would let /chat "use words you know" to mean reciting
-place names.
+Proper nouns go to Profile/<code>/names.jsonl instead. たなか and トロント are not
+vocabulary, and leaving them in would let /chat "use words you know" mean reciting place
+names. Detection is gloss-based (every gloss token capitalised), so it works for any
+language with English glosses.
+
+Connections: every Connections/*/data/languages/*/<languagename>.csv is merged; the
+connection folder name, lowercased, is the `sources` tag. Course position comes from
+that connection's profile.json. A row with seen=1 promotes unseen -> exposed regardless
+of unit, and nothing more.
 
 Usage:
     python build_lexicon.py
-    python build_lexicon.py --language Japanese
+    python build_lexicon.py --language fr          # switch: writes profile.json first
     python build_lexicon.py --through-unit 20
     python build_lexicon.py --dry-run
+    python build_lexicon.py --root DIR             # read DIR/Connections, DIR/Resources
+
+Environment:
+    LEXICON_DIR    replaces Profile/ (lexicon goes to $LEXICON_DIR/<code>/)
+    LEXICON_ROOT   same as --root
 """
 
 from __future__ import annotations
@@ -36,32 +52,51 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import os
 import re
+import sys
 import unicodedata
 from collections import Counter
 from datetime import date
 from pathlib import Path
 
-PROFILE_DIR = Path(__file__).resolve().parents[2]
-ROOT = PROFILE_DIR.parent
-CONNECTIONS = ROOT / "Connections"
-RESOURCES = ROOT / "Resources"
-LEXICON = PROFILE_DIR / "lexicon.jsonl"
-NAMES = PROFILE_DIR / "names.jsonl"
+SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+import languages  # noqa: E402
+
+PROFILE_DIR = Path(os.environ.get("LEXICON_DIR") or Path(__file__).resolve().parents[2])
+ROOT = Path(__file__).resolve().parents[3]
+_DATA_ROOT = Path(os.environ.get("LEXICON_ROOT") or ROOT)
+CONNECTIONS = _DATA_ROOT / "Connections"
+RESOURCES = _DATA_ROOT / "Resources"
 PROFILE = PROFILE_DIR / "profile.json"
 
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8")
+
 # Everything a connection or resource owns, refreshed on every build.
-DERIVED = ("kana", "kanji", "romaji", "gloss", "hints", "pos", "script", "variants", "jlpt", "rating",
-           "rating_source", "matched", "sources", "unit", "unit_name", "unit_topic",
-           "repeat_units", "audio", "language")
+DERIVED = ("kana", "kanji", "reading", "headword", "romaji", "gloss", "hints", "pos", "script",
+           "variants", "listed", "rating", "rating_source", "matched", "sources", "unit",
+           "unit_name", "unit_topic", "repeat_units", "audio", "seen", "language")
 # Learner evidence. Never overwritten.
 LEARNER = ("confidence", "seen_count", "srs", "first_seen", "last_seen")
 
-# The order fields appear in the JSONL, so a record reads sensibly.
-FIELD_ORDER = ["word", "kana", "kanji", "romaji", "gloss", "hints", "pos", "script", "variants",
-               "jlpt", "rating", "rating_source", "matched",
-               "sources", "unit", "unit_name", "unit_topic", "repeat_units", "audio",
+# The order fields appear in the JSONL, so a record reads sensibly. Japanese records carry
+# kana/kanji, every other language reading/headword (see the plugin's fields()).
+FIELD_ORDER = ["word", "kana", "kanji", "reading", "headword", "romaji", "gloss", "hints", "pos",
+               "script", "variants", "listed", "rating", "rating_source", "matched",
+               "sources", "unit", "unit_name", "unit_topic", "repeat_units", "audio", "seen",
                "language", "confidence", "seen_count", "first_seen", "last_seen", "srs"]
+
+DICTIONARY_COLUMNS = ("headword", "reading", "forms", "readings", "pos", "senses", "common")
+CONNECTION_COLUMNS = ("unit", "unit_name", "unit_topic", "position", "word", "reading", "gloss",
+                      "script", "repeat_units", "audio", "seen")
+
+# Last-resort difficulty for words no list can place: where the course introduces them.
+# Unit <= 100 is the easiest level, <= 250 the next, ... ; past the last band, the hardest.
+COURSE_BANDS = (100, 250, 500, 800, 1100)
 
 STOPWORDS = {"a", "an", "the", "to", "will", "am", "is", "are", "be", "been", "going",
              "do", "does", "did", "have", "has", "had", "i", "it", "one", "s", "not"}
@@ -81,13 +116,13 @@ FUNCTION_WORDS = STOPWORDS | {
     "them", "my", "your", "his", "our", "their", "no", "n't", "ll", "re", "ve", "d", "m"}
 ARTICLES = {"a", "an", "the"}
 
-GODAN_STEM = {"い": "う", "き": "く", "ぎ": "ぐ", "し": "す", "ち": "つ",
-              "に": "ぬ", "び": "ぶ", "み": "む", "り": "る"}
-POLITE_SUFFIXES = ("ませんでした", "ましょう", "ません", "ました", "ます")
-# Every polite ending the regular rule handles, for both irregulars -- a gap falls through
-# to the regular rule, and しましょう becomes しる and hits 知る, きましょう hits 着る.
-IRREGULAR = {stem + suffix: [plain] for stem, plain in (("し", "する"), ("き", "来る"))
-             for suffix in POLITE_SUFFIXES}
+
+class _Exact:
+    """Stand-in plugin for helpers called without one: exact matching only."""
+
+    @staticmethod
+    def normalise(text: str) -> str:
+        return text
 
 
 # --------------------------------------------------------------------------- helpers
@@ -95,65 +130,58 @@ def content_words(text: str) -> set[str]:
     return {w for w in re.split(r"[^a-z']+", text.lower()) if w and w not in STOPWORDS}
 
 
-def is_kanji(ch: str) -> bool:
-    return "CJK UNIFIED" in unicodedata.name(ch, "")
+def fold(text: str) -> str:
+    """Strip accents from Latin letters only: café -> cafe. Kana dakuten, hangul and
+    everything else pass through untouched, so this is a no-op for CJK text."""
+    out = []
+    for ch in unicodedata.normalize("NFD", text):
+        if unicodedata.combining(ch) and out and unicodedata.name(out[-1], "").startswith("LATIN"):
+            continue
+        out.append(ch)
+    return unicodedata.normalize("NFC", "".join(out))
 
 
-def has_kanji(text: str) -> bool:
-    return any(is_kanji(ch) for ch in text)
+def written(entry: dict | None) -> str | None:
+    """The entry's written form when it differs from its reading: 中国 for ちゅうごく.
+    None for a reading-only entry (kana-only JMdict words)."""
+    if not entry:
+        return None
+    headword = entry.get("headword") or ""
+    return headword if headword and headword != (entry.get("reading") or "") else None
 
 
-def is_kana(text: str) -> bool:
-    return bool(text) and all(
-        "HIRAGANA" in unicodedata.name(ch, "") or "KATAKANA" in unicodedata.name(ch, "") or ch in "ー・っッ"
-        for ch in text
-    )
-
-
-def script_of(word: str) -> str:
-    kinds = set()
-    for ch in word:
-        name = unicodedata.name(ch, "")
-        if "CJK UNIFIED" in name:
-            kinds.add("kanji")
-        elif "HIRAGANA" in name:
-            kinds.add("hiragana")
-        elif "KATAKANA" in name:
-            kinds.add("katakana")
-    if not kinds:
-        return "other"
-    return kinds.pop() if len(kinds) == 1 else "mixed"
-
-
-def level_num(level: str) -> int:
-    """N5 -> 5. Bigger is easier."""
-    return int(level[1:])
+def rel(path: Path) -> str:
+    try:
+        return path.resolve().relative_to(ROOT).as_posix()
+    except ValueError:
+        return str(path)
 
 
 # ------------------------------------------------------------------------ loading
-def find_wordlist(preferred: str | None) -> tuple[str, Path]:
-    candidates = sorted(CONNECTIONS.glob("*/data/languages/*/*.csv"))
-    if not candidates:
-        raise SystemExit("No course word table -- run  python setup.py  from the project root (or type /setup in Claude Code).")
-    if preferred:
-        for path in candidates:
-            if path.stem.lower() == preferred.lower():
-                return path.stem.capitalize(), path
-        raise SystemExit(f"No word table for {preferred!r}")
-    if len(candidates) > 1:
-        raise SystemExit(f"Several languages present -- pass --language")
-    return candidates[0].stem.capitalize(), candidates[0]
+def language_files(name: str) -> list[tuple[str, Path]]:
+    """(connection folder, table) for every connection that has words in this language."""
+    found = sorted(CONNECTIONS.glob(f"*/data/languages/*/{name.lower()}.csv"))
+    return [(p.relative_to(CONNECTIONS).parts[0], p) for p in found]
 
 
-def read_course(wordlist: Path) -> dict:
+def read_course(wordlist: Path, code: str) -> dict:
+    """The course entry in the connection's profile.json this table belongs to."""
     connection_root = wordlist.parents[3]
     path = connection_root / "profile.json"
     if not path.exists():
         return {}
-    profile = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        profile = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {}
+    courses = profile.get("courses") or {}
     wanted = wordlist.relative_to(connection_root).as_posix()
-    for course in profile.get("courses", {}).values():
-        if course.get("wordlist") == wanted:
+    for course in courses.values():
+        if isinstance(course, dict) and course.get("wordlist") == wanted:
+            return course
+    duo = languages.spec(code).get("duolingo") or code
+    for key, course in courses.items():
+        if isinstance(course, dict) and (course.get("learning_language") == duo or key.endswith(f"-{duo}")):
             return course
     return {}
 
@@ -165,36 +193,74 @@ def read_csv(path: Path) -> list[dict]:
         return list(csv.DictReader(fh))
 
 
-def load_tests(language: str) -> list[dict]:
-    folder = RESOURCES / "Tests" / language
+def _resource_files(folder: Path, source: str | None) -> list[Path]:
+    if not folder.exists():
+        return []
+    files = sorted(folder.glob(f"{source}-*.csv" if source else "*.csv"))
+    return files or ([] if source is None else sorted(folder.glob(f"{source}.csv")))
+
+
+def load_tests(name: str, source: str | None = None, order: list[str] | None = None) -> list[dict]:
+    """Test-list rows. Rows whose level is not one of `order` are dropped, with a warning."""
     rows = []
-    if folder.exists():
-        for path in sorted(folder.glob("*.csv")):
-            rows += [r for r in read_csv(path) if r.get("expression")]
+    for path in _resource_files(RESOURCES / "Tests" / name, source):
+        rows += [r for r in read_csv(path) if r.get("expression")]
+    if order is not None:
+        bad = Counter(r.get("level") for r in rows if r.get("level") not in order)
+        if bad:
+            print(f"  warning: ignored {sum(bad.values())} test rows with unknown levels "
+                  f"{sorted(bad)} (registry levels: {order})", file=sys.stderr)
+        rows = [r for r in rows if r.get("level") in order]
     return rows
 
 
-def load_dictionary(language: str) -> list[dict]:
-    return read_csv(RESOURCES / "Dictionary" / language / "jmdict.csv")
+def load_dictionary(name: str, source: str | None = None) -> list[dict]:
+    """Resources/Dictionary/<Name>/<source>.csv in the generic schema (CONTRACTS section 3).
+    With no source named, every CSV in the folder is used."""
+    folder = RESOURCES / "Dictionary" / name
+    paths = [folder / f"{source}.csv"] if source else sorted(folder.glob("*.csv")) if folder.exists() else []
+    rows = []
+    for path in paths:
+        if not path.exists():
+            continue
+        with path.open(encoding="utf-8-sig", newline="") as fh:
+            header = next(csv.reader(fh), [])
+        missing = [c for c in DICTIONARY_COLUMNS if c not in header]
+        if missing:
+            if "kanji_all" in header or "kana_all" in header:
+                raise SystemExit(f"{rel(path)} uses the old JMdict columns (kanji, kana, kanji_all, kana_all). "
+                                 f"Re-run  python Resources/Dictionary/data/fetch/fetch-jmdict.py  to rewrite it "
+                                 f"as {', '.join(DICTIONARY_COLUMNS)}.")
+            raise SystemExit(f"{rel(path)} is missing dictionary columns {missing}; "
+                             f"expected {', '.join(DICTIONARY_COLUMNS)}.")
+        rows += read_csv(path)
+    return rows
 
 
 # --------------------------------------------------------------------- dictionary
-def index_dictionary(entries: list[dict]) -> dict[str, list[dict]]:
+def index_dictionary(entries: list[dict], lang=None) -> dict[str, list[dict]]:
     """Surface form -> entries. A list, because 時 belongs to both とき and (rarely) 秋."""
+    norm = (lang or _Exact).normalise
     index: dict[str, list[dict]] = {}
     for entry in entries:
-        for form in entry["kanji_all"].split("|") + entry["kana_all"].split("|"):
+        for form in (entry.get("forms") or "").split("|") + (entry.get("readings") or "").split("|"):
             if form:
-                index.setdefault(form, []).append(entry)
+                index.setdefault(norm(form), []).append(entry)
+        # A headword not repeated in forms/readings must still find its own entry.
+        for form in (entry.get("headword"), entry.get("reading")):
+            if form and entry not in index.get(norm(form), []):
+                index.setdefault(norm(form), []).append(entry)
     return index
 
 
-def best_entry(word: str, gloss: list[str], index: dict[str, list[dict]]) -> dict | None:
+def best_entry(word: str, gloss: list[str], index: dict[str, list[dict]], lang=None) -> dict | None:
     """The entry that means what the source said it means.
 
     Without the sense check 本 resolves to もと rather than ほん, and が to 絵.
     """
-    candidates = index.get(word)
+    norm = (lang or _Exact).normalise
+    key = norm(word)
+    candidates = index.get(key)
     if not candidates:
         return None
     if len(candidates) == 1:
@@ -205,14 +271,14 @@ def best_entry(word: str, gloss: list[str], index: dict[str, list[dict]]) -> dic
     # particle, auxiliary or conjunction among the candidates is the word.
     if gloss and 2 * sum(1 for g in gloss if _function_only(g)) >= len(gloss):
         # Headword only: て must not land on って just because JMdict lists て as a variant.
-        grammatical = [c for c in candidates if word in (c["kana"], c["kanji"])
-                       and any(p in ("prt", "conj", "cop") or p.startswith("aux") for p in c["pos"].split("|"))]
+        grammatical = [c for c in candidates if key in (norm(c.get("reading") or ""), norm(c.get("headword") or ""))
+                       and any(p in ("prt", "conj", "cop") or p.startswith("aux") for p in (c.get("pos") or "").split("|"))]
         if grammatical:
             return grammatical[0]
     wanted = content_words(" ".join(gloss or []))
 
     def score(entry: dict) -> tuple[int, int]:
-        return (len(content_words(entry.get("senses", "").replace("|", " ")) & wanted),
+        return (len(content_words((entry.get("senses") or "").replace("|", " ")) & wanted),
                 1 if entry.get("common") == "1" else 0)
 
     ranked = sorted(candidates, key=score, reverse=True)
@@ -289,28 +355,43 @@ def clean_gloss(hints: list[str], entry: dict | None, trusted: bool = True) -> l
 
 # -------------------------------------------------------------------------- grading
 class Grader:
-    """Assigns (jlpt, rating, source, matched) to a word.
+    """Assigns (listed, level, source, matched) to a word.
 
     Tiers run most-trustworthy first. The first four mean "this is the listed word";
-    the rest mean "this is not listed, but here is a defensible difficulty".
+    the rest mean "this is not listed, but here is a defensible difficulty". The tier
+    rules are generic; what counts as a token, a lemma or a heavy piece is the plugin's.
+    `order` is the registry's levels, easiest first.
     """
 
-    def __init__(self, tests: list[dict]):
+    def __init__(self, tests: list[dict], lang, order: list[str]):
+        self.lang = lang
+        self.order = list(order)
+        norm = lang.normalise
         self.by_expression: dict[str, list[dict]] = {}
         self.by_reading: dict[str, list[dict]] = {}
+        self.by_folded: dict[str, list[dict]] = {}
         self.by_meaning: dict[str, list[dict]] = {}
-        self.level: dict[str, str] = {}
+        self.level = languages.Levels(self.order)
         for t in tests:
-            self.by_expression.setdefault(t["expression"], []).append(t)
-            if t.get("reading"):
-                self.by_reading.setdefault(t["reading"], []).append(t)
+            if t.get("level") not in self.order:
+                continue
+            expression = norm(t["expression"])
+            reading = norm(t["reading"]) if t.get("reading") else ""
+            self.by_expression.setdefault(expression, []).append(t)
+            if reading:
+                self.by_reading.setdefault(reading, []).append(t)
+            for key in dict.fromkeys(k for k in (fold(expression), fold(reading)) if k):
+                self.by_folded.setdefault(key, []).append(t)
             for sense in self._senses(t.get("meaning", "")):
                 self.by_meaning.setdefault(sense, []).append(t)
-            for key in (t["expression"], t.get("reading")):
+            for key in (expression, reading):
                 if key:
                     prior = self.level.get(key)
-                    if prior is None or level_num(t["level"]) > level_num(prior):
+                    if prior is None or self._easier(t["level"], prior):
                         self.level[key] = t["level"]
+
+    def _easier(self, a: str, b: str) -> bool:
+        return self.order.index(a) < self.order.index(b)
 
     @staticmethod
     def _senses(text: str) -> set[str]:
@@ -321,48 +402,41 @@ class Grader:
                 out.add(sense)
         return out
 
-    @staticmethod
-    def _pick(candidates: list[dict]) -> tuple[str, str]:
+    def _pick(self, candidates: list[dict]) -> tuple[str, str]:
         """Easiest level, and a citation from an entry actually at that level."""
-        level = max({c["level"] for c in candidates}, key=level_num)
+        level = min({c["level"] for c in candidates}, key=self.order.index)
         return level, next(c for c in candidates if c["level"] == level)["expression"]
 
-    def _dictionary_forms(self, word: str) -> list[str]:
-        if word in IRREGULAR:
-            return IRREGULAR[word]
-        for suffix in POLITE_SUFFIXES:
-            if word.endswith(suffix) and len(word) > len(suffix):
-                stem = word[: -len(suffix)]
-                forms = [stem + "る"]
-                if stem[-1] in GODAN_STEM:
-                    forms.append(stem[:-1] + GODAN_STEM[stem[-1]])
-                return [f for f in forms if len(f) >= 2]
-        return []
+    @staticmethod
+    def _join(units: list[str], word: str) -> str:
+        """Pieces are characters when the units concatenate back to the word, else words."""
+        return "" if "".join(units) == word else " "
 
     def _decompose(self, word: str) -> list[str] | None:
-        """Greedy longest-match split, kanji only.
+        """Greedy longest-match split over the plugin's tokens.
 
-        Kana strings segment into nonsense: すし becomes す (vinegar) + し (death),
-        たなか becomes たな + か. Kanji carries enough per character to be meaningful.
+        Japanese tokens kanji words only: kana strings segment into nonsense -- すし
+        becomes す (vinegar) + し (death), たなか becomes たな + か. A single-token piece
+        must carry weight >= 2 and be a content word, which keeps lone kana and lone
+        articles from being "parts".
         """
-        if not has_kanji(word):
+        lang = self.lang
+        units = lang.tokens(word)
+        if not units:
             return None
+        sep = self._join(units, word)
         parts, i = [], 0
-        while i < len(word):
-            for end in range(len(word), i, -1):
-                piece = word[i:end]
-                if piece in self.level and (len(piece) > 1 or not is_kana(piece)):
+        while i < len(units):
+            for end in range(len(units), i, -1):
+                piece = sep.join(units[i:end])
+                if lang.normalise(piece) in self.level and (
+                        end - i > 1 or (lang.weight(piece) >= 2 and lang.is_content(piece))):
                     parts.append(piece)
                     i = end
                     break
             else:
                 return None
         return parts if len(parts) >= 2 else None
-
-    @staticmethod
-    def _weight(text: str) -> int:
-        """Information content: a kanji is worth two kana, since there are far more."""
-        return sum(2 if is_kanji(ch) else 1 for ch in text)
 
     def _contains(self, word: str) -> tuple[str, str] | None:
         """A listed word inside this one: アイスコーヒー -> コーヒー.
@@ -373,52 +447,85 @@ class Grader:
 
           weight >= 3   two kana is a syllable, not a word; 日本 clears it on kanji
           >= 55% cover  the piece must be most of the word, not a fragment of it
+
+        Pieces are runs of the plugin's tokens (characters when it returns none), and a
+        piece that is a bare particle or article never counts.
         """
+        lang = self.lang
+        units = lang.tokens(word) or list(word)
+        sep = self._join(units, word)
+        total = lang.weight(word)
+        if total <= 0:
+            return None
         best = None
-        for size in range(len(word) - 1, 1, -1):
-            for start in range(len(word) - size + 1):
-                piece = word[start:start + size]
-                if piece not in self.level:
+        for size in range(len(units) - 1, 0, -1):
+            for start in range(len(units) - size + 1):
+                piece = sep.join(units[start:start + size])
+                key = lang.normalise(piece)
+                if key not in self.level:
                     continue
-                if self._weight(piece) < 3 or self._weight(piece) / self._weight(word) < 0.55:
+                weight = lang.weight(piece)
+                if weight < 3 or weight / total < 0.55 or not lang.is_content(piece):
                     continue
                 # Hardest wins: knowing the whole means knowing its most demanding part.
-                if best is None or level_num(self.level[piece]) < level_num(self.level[best]):
-                    best = piece
+                if best is None or self._easier(self.level[best[0]], self.level[key]):
+                    best = (key, piece)
             if best:
-                return self.level[best], best
+                return self.level[best[0]], best[1]
         return None
 
+    def _stem(self, a: str, b: str) -> int:
+        """Weight of the shared leading prefix (one kanji counting as much as two kana)."""
+        norm = self.lang.normalise
+        a, b = norm(a), norm(b)
+        n = 0
+        for x, y in zip(a, b):
+            if x != y:
+                break
+            n += 1
+        return self.lang.weight(a[:n]) if n else 0
+
     def grade(self, word: str, gloss: list[str], entry: dict | None) -> tuple[bool, str | None, str | None, str | None]:
+        norm = self.lang.normalise
+        key = norm(word)
         # --- listed: this exact lexeme is on a test list -------------------------
-        if word in self.by_expression:
-            level, via = self._pick(self.by_expression[word])
+        if key in self.by_expression:
+            level, via = self._pick(self.by_expression[key])
             return True, level, "expression", via
-        if word in self.by_reading:
-            level, via = self._pick(self.by_reading[word])
+        if key in self.by_reading:
+            level, via = self._pick(self.by_reading[key])
             return True, level, "reading", via
         if entry:
-            # Kanji spellings only. Kana readings are homophone magnets -- JMdict lists
+            # Written spellings only. Readings are homophone magnets -- JMdict lists
             # とうけい as an alternate reading of 東京, which lands on 統計.
-            for form in entry["kanji_all"].split("|"):
-                if form and form != word and form in self.by_expression:
-                    level, via = self._pick(self.by_expression[form])
+            for form in (entry.get("forms") or "").split("|"):
+                if form and form != word and norm(form) in self.by_expression:
+                    level, via = self._pick(self.by_expression[norm(form)])
                     return True, level, "variant", via
-        inflected = []
-        for form in self._dictionary_forms(word):
-            inflected += self.by_expression.get(form, []) + self.by_reading.get(form, [])
+        exact: list[dict] = []
+        loose: list[dict] = []
+        for form in self.lang.lemmas(word):
+            f = norm(form)
+            exact += self.by_expression.get(f, []) + self.by_reading.get(f, [])
+            loose += self.by_folded.get(fold(f), [])
+        seen = {id(c) for c in exact}
+        inflected = exact + [c for c in loose if id(c) not in seen and not seen.add(id(c))]
         if inflected:
+            # Meaning overlap and accent agreement are tie-breakers, never gates: gating
+            # on meaning drops 学びます -> 学ぶ ("learns" vs "to learn; to study").
             wanted = content_words(" ".join(gloss or []))
-            agreeing = [i for i in inflected if content_words(i.get("meaning", "")) & wanted]
-            level, via = self._pick(agreeing or inflected)
+            pool = [i for i in inflected if content_words(i.get("meaning", "")) & wanted] or inflected
+            exact_ids = {id(c) for c in exact}
+            pool = [c for c in pool if id(c) in exact_ids] or pool
+            level, via = self._pick(pool)
             return True, level, "inflection", via
 
         # --- inferred: not listed, but gradeable ---------------------------------
-        for candidate in (word, (entry or {}).get("kanji")):
+        for candidate in (word, written(entry)):
             parts = self._decompose(candidate) if candidate else None
             if parts:
                 # Hardest part: a compound is only readable once you know all of it.
-                hardest = min((self.level[p] for p in parts), key=level_num)
+                hardest = max((self.level[norm(p)] for p in parts), key=self.order.index)
                 return False, hardest, "composite", "+".join(parts)
 
         stem_hits = []
@@ -433,34 +540,24 @@ class Grader:
             level, via = self._pick(corroborated)
             return False, level, "stem", via
 
-        for candidate in (word, (entry or {}).get("kanji")):
+        for candidate in (word, written(entry)):
             found = self._contains(candidate) if candidate else None
             if found:
                 return False, found[0], "contains", found[1]
 
         return False, None, None, None
 
-    @staticmethod
-    def _stem(a: str, b: str) -> int:
-        score = 0
-        for x, y in zip(a, b):
-            if x != y:
-                break
-            score += 2 if is_kanji(x) else 1
-        return score
+    def rate_name(self, word: str) -> tuple[str | None, str | None]:
+        """Names get a difficulty from the plugin (script-based), since no list carries them."""
+        result = self.lang.name_rating(word, self.level)
+        if result is None:
+            return None, None
+        if isinstance(result, tuple):
+            return result[0], result[1]
+        return result, "name"
 
-    def rate_name(self, word: str) -> tuple[str, str]:
-        """Names get a difficulty from their script, since no list will carry them.
-
-        Kanji names are as hard as their hardest character; short kana names are easy.
-        """
-        kanji_levels = [self.level[ch] for ch in word if is_kanji(ch) and ch in self.level]
-        if kanji_levels:
-            return min(kanji_levels, key=level_num), "name-kanji"
-        if has_kanji(word):
-            # Kanji we cannot place at all is not beginner material.
-            return "N1", "name-kanji"
-        return ("N5" if len(word) <= 4 else "N4"), "name-kana"
+    def rating(self, label: str | None) -> int | None:
+        return languages.rating_of(label, self.order) if label else None
 
 
 def looks_like_name(gloss: list[str]) -> bool:
@@ -481,11 +578,17 @@ def looks_like_name(gloss: list[str]) -> bool:
     return True
 
 
+def course_rating(unit: int, order: list[str]) -> int:
+    """Rating from course position alone -- not a test judgement, labelled as such."""
+    index = min(sum(1 for band in COURSE_BANDS if unit > band), len(order) - 1)
+    return len(order) - index
+
+
 # ----------------------------------------------------------------------------- main
 def canonical(word: str, entry: dict | None) -> str:
     """Dedup key. Two surfaces of one dictionary word collapse: おちゃ and お茶."""
     if entry:
-        return f"{entry['kanji']}|{entry['kana']}"
+        return f"{entry.get('headword') or ''}|{entry.get('reading') or ''}"
     return word
 
 
@@ -501,66 +604,137 @@ def ordered(record: dict) -> dict:
 
 def write_jsonl(path: Path, records: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="\n") as fh:
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("w", encoding="utf-8", newline="\n") as fh:
         for record in records:
             fh.write(json.dumps(ordered(record), ensure_ascii=False) + "\n")
+    os.replace(tmp, path)
+
+
+def lexicon_path(code: str) -> Path:
+    return languages.language_dir(PROFILE_DIR, code) / "lexicon.jsonl"
+
+
+def names_path(code: str) -> Path:
+    return languages.language_dir(PROFILE_DIR, code) / "names.jsonl"
+
+
+def resolve_language(arg: str | None, dry_run: bool) -> str:
+    """--language (a code or a registry name) wins and is written; else profile.json."""
+    if arg:
+        reg = languages.registry()
+        code = arg if arg in reg else {v["name"].lower(): k for k, v in reg.items()}.get(arg.lower())
+        if code is None:
+            raise SystemExit(f"Unknown language {arg!r} -- supported: {', '.join(sorted(reg))}")
+        return code
+    return languages.active_code(PROFILE, write=not dry_run)
+
+
+def int_or_none(value) -> int | None:
+    value = (value or "").strip() if isinstance(value, str) else value
+    try:
+        return int(value) if value not in (None, "") else None
+    except ValueError:
+        return None
 
 
 def main() -> None:
+    global CONNECTIONS, RESOURCES
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--language")
-    ap.add_argument("--through-unit", type=int)
+    ap.add_argument("--language", help="registry code (or name); switches profile.json to it")
+    ap.add_argument("--through-unit", type=int, help="override every connection's course position")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--root", help="read Connections/ and Resources/ under this directory instead")
     args = ap.parse_args()
+    if args.root:
+        CONNECTIONS = Path(args.root) / "Connections"
+        RESOURCES = Path(args.root) / "Resources"
 
-    language, wordlist = find_wordlist(args.language)
-    connection = wordlist.relative_to(CONNECTIONS).parts[0].lower()
-    course = read_course(wordlist)
-    through = args.through_unit if args.through_unit is not None else course.get("through_unit")
+    code = resolve_language(args.language, args.dry_run)
+    spec = languages.spec(code)
+    lang = languages.plugin(code)
+    order = languages.levels(code)
+    if not order:
+        raise SystemExit(f"languages.json gives {code} no test levels")
+    name = spec["name"]
 
-    dictionary = index_dictionary(load_dictionary(language))
-    tests = load_tests(language)
-    grader = Grader(tests)
+    lexicon_file, names_file = lexicon_path(code), names_path(code)
+    previous_files = [lexicon_file, names_file]
+    if args.dry_run:
+        if code == languages.DEFAULT and not lexicon_file.parent.exists():
+            previous_files = [PROFILE_DIR / "lexicon.jsonl", PROFILE_DIR / "names.jsonl"]
+    else:
+        moved = languages.migrate_flat(PROFILE_DIR, code)
+        if moved:
+            print(f"moved {', '.join(moved)} into {rel(lexicon_file.parent)}/")
+
+    tables = language_files(name)
+    if not tables:
+        raise SystemExit(f"No {name} word table under {rel(CONNECTIONS)}/*/data/languages/*/{name.lower()}.csv -- "
+                         "run  python setup.py  from the project root (or type /setup in Claude Code).")
+
+    # Per connection: its course entry and position. A connection without units (Anki)
+    # contributes no position.
+    connections: dict[str, dict] = {}
+    rows_by_connection: list[tuple[str, list[dict]]] = []
+    for folder, path in tables:
+        rows = read_csv(path)
+        has_units = any(int_or_none(r.get("unit")) is not None for r in rows)
+        course = read_course(path, code)
+        through = None
+        if has_units:
+            through = args.through_unit if args.through_unit is not None else course.get("through_unit")
+        info = connections.setdefault(folder, {"course": course, "through_unit": None, "has_units": False})
+        info["has_units"] |= has_units
+        if through is not None:
+            info["through_unit"] = through if info["through_unit"] is None else max(info["through_unit"], through)
+        rows_by_connection.append((folder, rows))
+    through_of = {folder.lower(): info["through_unit"] for folder, info in connections.items()}
+
+    dictionary = index_dictionary(load_dictionary(name, (spec.get("dictionary") or {}).get("source")), lang)
+    tests = load_tests(name, (spec.get("tests") or {}).get("source"), order)
+    grader = Grader(tests, lang, order)
     today = date.today().isoformat()
+    norm = lang.normalise
 
     # Learner evidence keyed by surface form, carried across the rebuild.
-    previous = load_existing(LEXICON) | load_existing(NAMES)
+    previous = load_existing(previous_files[0]) | load_existing(previous_files[1])
 
     records: dict[str, dict] = {}          # canonical key -> record
+    connection_tags = {folder.lower() for folder, _ in tables}
 
     def upsert(word: str, gloss: list[str], source: str, extra: dict) -> dict:
         # The raw hints pick the entry -- the cleaning needs an entry to clean against.
-        entry = best_entry(word, gloss, dictionary) if dictionary else None
+        entry = best_entry(word, gloss, dictionary, lang) if dictionary else None
         key = canonical(word, entry)
         record = records.get(key)
         hints = gloss
-        if source == connection and entry:
-            # Only the course's gloss is a union of hints; a test row's meaning is
+        if source in connection_tags and entry:
+            # Only a connection's gloss is a union of hints; a test row's meaning is
             # written for that one entry and has nothing to strip.
-            trusted = len(dictionary[word]) == 1 or bool(
+            trusted = len(dictionary[norm(word)]) == 1 or bool(
                 content_words(" ".join(gloss)) & content_words(entry["senses"].replace("|", " ")))
             gloss = clean_gloss(gloss, entry, trusted)
         if record is None:
             # Grading sees the cleaned gloss, so the stem tier cannot match on a
             # homophone's hint ("door" for と).
-            jlpt, level, how, via = grader.grade(word, gloss, entry)
+            listed, level, how, via = grader.grade(word, gloss, entry)
             record = {
                 "word": word,
-                "kana": (entry or {}).get("kana") or (word if is_kana(word) else None),
-                "kanji": (entry or {}).get("kanji") or (word if has_kanji(word) else None),
+                **lang.fields(word, entry),
                 "romaji": None,
                 "gloss": gloss,
                 "hints": hints,
-                "pos": (entry["pos"].split("|") if entry and entry["pos"] else []),
-                "script": script_of(word),
-                "variants": [f for f in ((entry["kanji_all"] + "|" + entry["kana_all"]).split("|") if entry else [])
-                             if f and f != word],
-                "jlpt": jlpt,
-                "rating": level_num(level) if level else None,
+                "pos": ((entry.get("pos") or "").split("|") if entry and entry.get("pos") else []),
+                "script": lang.script_of(word),
+                "variants": [f for f in (((entry.get("forms") or "") + "|" + (entry.get("readings") or "")).split("|")
+                                         if entry else []) if f and f != word],
+                "listed": listed,
+                "rating": grader.rating(level),
                 "rating_source": how,
                 "matched": via,
                 "sources": [],
-                "language": language,
+                "language": name,
             }
             records[key] = record
         if source not in record["sources"]:
@@ -578,24 +752,42 @@ def main() -> None:
                     continue
                 if earlier or record.get(field) is None:
                     record[field] = value
+            if earlier:
+                record["_unit_from"] = source
             record["repeat_units"] = sorted(units - {record["unit"]})
+        else:
+            # No unit (Anki, tests): fill blanks only, never displace a course's metadata.
+            for field, value in extra.items():
+                if value is not None and record.get(field) is None and field not in ("unit", "repeat_units"):
+                    record[field] = value
         if not record["gloss"]:
             record["gloss"] = gloss
         return record
 
-    # 1. Course words -- these carry unit position, audio and the learner's exposure.
-    for row in read_csv(wordlist):
-        gloss = [g for g in row["gloss"].split("|") if g]
-        upsert(row["word"], gloss, connection, {
-            "romaji": row["reading"] or None,
-            "unit": int(row["unit"]),
-            "unit_name": row["unit_name"],
-            "unit_topic": row["unit_topic"],
-            "repeat_units": [int(u) for u in row["repeat_units"].split("|") if u],
-            "audio": row["audio"] or None,
-        })
+    # 1. Connection words -- unit position, audio, and the learner's exposure.
+    for folder, rows in rows_by_connection:
+        tag = folder.lower()
+        for row in rows:
+            word = (row.get("word") or "").strip()
+            if not word:
+                continue
+            gloss = [g for g in (row.get("gloss") or "").split("|") if g]
+            unit = int_or_none(row.get("unit"))
+            extra = {"romaji": row.get("reading") or None, "audio": row.get("audio") or None}
+            if unit is not None:
+                extra = {
+                    "romaji": row.get("reading") or None,
+                    "unit": unit,
+                    "unit_name": row.get("unit_name") or "",
+                    "unit_topic": row.get("unit_topic") or "",
+                    "repeat_units": [int(u) for u in (row.get("repeat_units") or "").split("|") if u.strip().isdigit()],
+                    "audio": row.get("audio") or None,
+                }
+            record = upsert(word, gloss, tag, extra)
+            if (row.get("seen") or "").strip() == "1":
+                record["seen"] = True
 
-    # 2. Test words the course never teaches -- still worth knowing they exist.
+    # 2. Test words no connection has -- still worth knowing they exist.
     for t in tests:
         gloss = [g.strip() for g in t["meaning"].replace(";", ",").split(",") if g.strip()]
         upsert(t["expression"], gloss, "tests", {})
@@ -603,52 +795,55 @@ def main() -> None:
     # 3. Split names out, and restore learner evidence by surface form.
     lexicon, names = [], []
     for record in records.values():
+        unit_from = record.pop("_unit_from", None)
         # Names are judged on the raw hints: a cleaned gloss can fall back to dictionary
         # senses, and "rice paddy" would turn たなか back into vocabulary.
-        name = looks_like_name(record["hints"] or record["gloss"]) and not record["jlpt"]
+        name_like = looks_like_name(record["hints"] or record["gloss"]) and not record["listed"]
         # Raw hints are kept only where cleaning dropped something -- that is the record
         # of what was stripped, and everywhere else it would just repeat the gloss.
         if record["hints"] == record["gloss"]:
             del record["hints"]
-        if name and record["rating"] is None:
+        if name_like and record["rating"] is None:
             level, how = grader.rate_name(record["word"])
-            record["rating"], record["rating_source"] = level_num(level), how
+            if level:
+                record["rating"], record["rating_source"] = grader.rating(level), how
 
-        # Last resort: where the course introduced it. Not a JLPT judgement at all --
+        # Last resort: where the course introduced it. Not a test judgement at all --
         # just the only difficulty signal left for loanwords the test lists ignore
         # (ピザ, コンビニ, スマホ). Monotonic in course order, and labelled as such.
         if record["rating"] is None and record.get("unit"):
-            unit = record["unit"]
-            record["rating"] = 5 if unit <= 100 else 4 if unit <= 250 else 3 if unit <= 500 else 2 if unit <= 800 else 1
+            record["rating"] = course_rating(record["unit"], order)
             record["rating_source"] = "course-position"
 
+        through = through_of.get(unit_from) if unit_from else None
+        reached = (through is not None and record.get("unit") is not None and record["unit"] <= through) \
+            or bool(record.get("seen"))
         prior = previous.get(record["word"])
         record["confidence"] = (prior or {}).get("confidence")
         if record["confidence"] is None:
-            reached = through is not None and record.get("unit") is not None and record["unit"] <= through
             record["confidence"] = "exposed" if reached else "unseen"
-        elif record["confidence"] == "unseen":
-            reached = through is not None and record.get("unit") is not None and record["unit"] <= through
-            if reached:
-                record["confidence"] = "exposed"
+        elif record["confidence"] == "unseen" and reached:
+            record["confidence"] = "exposed"
         record["seen_count"] = (prior or {}).get("seen_count", 0)
         record["first_seen"] = (prior or {}).get("first_seen", today)
         if (prior or {}).get("last_seen"):
             record["last_seen"] = prior["last_seen"]
         record["srs"] = (prior or {}).get("srs")
 
-        (names if name else lexicon).append(record)
+        (names if name_like else lexicon).append(record)
 
     lexicon.sort(key=lambda r: (r.get("unit") or 10**6, -(r.get("rating") or 0), r["word"]))
     names.sort(key=lambda r: (r.get("unit") or 10**6, r["word"]))
 
     # ------------------------------------------------------------------ reporting
     graded = [r for r in lexicon if r["rating"]]
-    listed = [r for r in lexicon if r["jlpt"]]
+    listed = [r for r in lexicon if r["listed"]]
     by_source = Counter(r["rating_source"] for r in lexicon if r["rating_source"])
     by_origin = Counter(tuple(sorted(r["sources"])) for r in lexicon)
+    positions = {f: i["through_unit"] for f, i in connections.items() if i["has_units"]}
+    position_text = ", ".join(f"{f} unit {u}" for f, u in positions.items()) or "none (no unit-gated connection)"
 
-    print(f"{language} -- course position: unit {through}")
+    print(f"{name} ({code}) -- course position: {position_text}")
     print(f"  lexicon {len(lexicon):,}  ·  names {len(names):,}")
     for origin, count in by_origin.most_common():
         print(f"      {'+'.join(origin):<18} {count:>6,}")
@@ -656,37 +851,45 @@ def main() -> None:
           f"  ·  on a test list {len(listed):,} ({100*len(listed)/max(len(lexicon),1):.0f}%)")
     print("      " + ", ".join(f"{k}={v}" for k, v in by_source.most_common()))
     ratings = Counter(r["rating"] for r in lexicon if r["rating"])
-    print("      " + " · ".join(f"N{n}={ratings.get(n, 0)}" for n in (5, 4, 3, 2, 1)))
-    print(f"  kana {sum(1 for r in lexicon if r['kana']):,} ({100*sum(1 for r in lexicon if r['kana'])/max(len(lexicon),1):.0f}%)"
-          f"  ·  kanji {sum(1 for r in lexicon if r['kanji']):,}"
-          f"  ·  variants {sum(1 for r in lexicon if r['variants']):,}")
-    # Same rule as `lexicon.py stats`: unlocked, and not past the course position --
-    # what chat actually receives, not every word ever unlocked.
+    print("      " + " · ".join(f"{label}={ratings.get(languages.rating_of(label, order), 0)}" for label in order))
+    fields = list(lang.fields("", None))
+    print("  " + "  ·  ".join(f"{f} {sum(1 for r in lexicon if r.get(f)):,}" for f in fields)
+          + f"  ·  variants {sum(1 for r in lexicon if r['variants']):,}")
+    # Same rule as `lexicon.py stats`: unlocked, and an `exposed` word not past the
+    # furthest course position -- what chat actually receives.
+    furthest = max((u for u in positions.values() if u is not None), default=None)
     usable = sum(1 for r in lexicon if r["confidence"] != "unseen"
-                 and (through is None or (r.get("unit") or 0) <= through))
+                 and (r["confidence"] != "exposed" or furthest is None or r.get("seen")
+                      or (r.get("unit") or 0) <= furthest))
     print(f"  usable for chat: {usable:,}")
 
     if args.dry_run:
         print("dry run -- nothing written")
         return
 
-    write_jsonl(LEXICON, lexicon)
-    write_jsonl(NAMES, names)
+    write_jsonl(lexicon_file, lexicon)
+    write_jsonl(names_file, names)
 
     profile = json.loads(PROFILE.read_text(encoding="utf-8")) if PROFILE.exists() else {}
-    profile["language"] = language
+    if profile.get("language") not in (code, name):
+        profile["connections"] = {}  # positions belong to the language they were built for
+    profile["language"] = code
     profile["updated"] = today
-    profile.setdefault("connections", {})[connection.capitalize()] = {
-        "course": f"{course.get('from_language', '?')}-{course.get('learning_language', '?')}",
-        "through_unit": through,
-    }
+    profile.setdefault("connections", {})
+    for folder, info in connections.items():
+        course = info["course"]
+        profile["connections"][folder] = {
+            "course": f"{course.get('from_language', '?')}-{course.get('learning_language', '?')}" if course else None,
+            "through_unit": info["through_unit"],
+        }
     profile["lexicon"] = {
         "total": len(lexicon), "names": len(names), "usable": usable,
         "graded": len(graded), "on_test_list": len(listed),
         **{k: sum(1 for r in lexicon if r["confidence"] == k) for k in ("unseen", "exposed", "shaky", "known")},
     }
+    PROFILE.parent.mkdir(parents=True, exist_ok=True)
     PROFILE.write_text(json.dumps(profile, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    print(f"wrote {LEXICON.relative_to(ROOT)}, {NAMES.relative_to(ROOT)} and {PROFILE.relative_to(ROOT)}")
+    print(f"wrote {rel(lexicon_file)}, {rel(names_file)} and {rel(PROFILE)}")
 
 
 if __name__ == "__main__":

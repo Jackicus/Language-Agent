@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
-"""Query and update Profile/lexicon.jsonl.
+"""Query and update Profile/<code>/lexicon.jsonl for the active language.
 
 The lexicon is far too large to paste into a prompt, so the chat skill talks to it
 through this script instead of reading the file. Everything prints JSON on stdout
 except the --compact views, which print one word per line for pasting into a prompt.
+
+The active language is Profile/profile.json["language"] (a key of languages.json;
+missing -> "ja", written back). Labels, readings, scripts and test levels come from the
+registry and the language's plugin in languages/.
 
 Run from Profile/data/scripts/:
 
@@ -13,7 +17,8 @@ Run from Profile/data/scripts/:
     python lexicon.py set-unit 95                    # record course position by hand
     python lexicon.py mark 食べる known そうです shaky   # kanji, kana or any variant
     python lexicon.py look 食べる
-    python lexicon.py quiz --count 8 [--only due|shaky|new]
+    python lexicon.py quiz --count 8 [--only due|shaky|new] [--direction jp2en|en2jp]
+    python lexicon.py tests                          # coverage per registry test level
     python lexicon.py review [--all] [--compact]     # words the schedule says are due
 
 Confidence ladder:
@@ -30,7 +35,7 @@ Review schedule (the `srs` field, Leitner boxes):
     exposed and unseen leave srs untouched.
 
 Environment:
-    LEXICON_DIR    directory holding lexicon.jsonl, names.jsonl and profile.json
+    LEXICON_DIR    directory holding profile.json and <code>/lexicon.jsonl, <code>/names.jsonl
                    (default: Profile/) -- point it at a copy for tests and dry runs
     LEXICON_TODAY  YYYY-MM-DD to use as "today" for scheduling (default: the real date)
 """
@@ -46,11 +51,14 @@ import sys
 from datetime import date, timedelta
 from pathlib import Path
 
+SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
+import languages  # noqa: E402
+
 # scripts live at Profile/data/scripts/, so Profile is three up.
 PROFILE_DIR = Path(os.environ.get("LEXICON_DIR") or Path(__file__).resolve().parents[2])
 ROOT = Path(__file__).resolve().parents[3]
-LEXICON = PROFILE_DIR / "lexicon.jsonl"
-NAMES = PROFILE_DIR / "names.jsonl"
 PROFILE = PROFILE_DIR / "profile.json"
 
 # Windows consoles default to cp1252, which cannot encode Japanese -- every command
@@ -66,34 +74,75 @@ USABLE = ("exposed", "shaky", "known")
 # Leitner intervals in days, indexed by box - 1.
 INTERVALS = (1, 2, 4, 8, 16, 32)
 
-# Grammar the course teaches structurally rather than as vocabulary. These are never
-# quizzed -- their glosses are a dump of every English word they ever translate to --
-# and vocab lists them on one line instead of one per word. は is listed by hand because
-# JMdict resolves the bare kana to 歯 ("tooth") and gives it no particle POS.
-STRUCTURAL = frozenset(
-    "は が を に で と も の か へ や ね よ な から まで より ので のに けど だけ など "
-    "です ます だ である さん ちゃん くん さま".split()
-)
-KANA = re.compile(r"^[぀-ヿ]+$")
 
 
 def today() -> str:
     return os.environ.get("LEXICON_TODAY") or date.today().isoformat()
 
 
+_code_cache: dict = {}
+
+
+def code() -> str:
+    """The active language code (CONTRACTS section 1). Cached per profile.json version,
+    since stats asks for it once per record."""
+    try:
+        stamp = PROFILE.stat().st_mtime_ns
+    except OSError:
+        stamp = None
+    key = (str(PROFILE), stamp)
+    if key not in _code_cache:
+        _code_cache.clear()
+        result = languages.active_code(PROFILE)
+        try:  # active_code may have just written the file: cache under its new stamp
+            key = (str(PROFILE), PROFILE.stat().st_mtime_ns)
+        except OSError:
+            pass
+        _code_cache[key] = result
+        return result
+    return _code_cache[key]
+
+
+def lang():
+    """The active language's plugin."""
+    return languages.plugin(code())
+
+
+def level_order() -> list[str]:
+    """Registry test levels, easiest first: rating = len(levels) - index."""
+    return languages.levels(code())
+
+
+def level_label(rating) -> str | None:
+    """5 -> "N5" for Japanese, 6 -> "A1" for a CEFR language."""
+    return languages.label_of(rating, level_order())
+
+
+def lexicon_path() -> Path:
+    return languages.language_dir(PROFILE_DIR, code()) / "lexicon.jsonl"
+
+
+def names_path() -> Path:
+    return languages.language_dir(PROFILE_DIR, code()) / "names.jsonl"
+
+
 def load() -> list[dict]:
-    if not LEXICON.exists():
-        sys.exit(f"{LEXICON} not found -- run  python setup.py  from the project root (or type /setup in Claude Code).")
-    return [json.loads(line) for line in LEXICON.read_text(encoding="utf-8").splitlines() if line.strip()]
+    # The pre-registry flat layout moves into Profile/ja/ on first touch, as the build does.
+    languages.migrate_flat(PROFILE_DIR, code())
+    path = lexicon_path()
+    if not path.exists():
+        sys.exit(f"{path} not found -- run  python setup.py  from the project root (or type /setup in Claude Code).")
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
 def save(records: list[dict]) -> None:
     # Write-then-rename, so a crash mid-write cannot leave a truncated lexicon.
-    tmp = LEXICON.with_suffix(".jsonl.tmp")
+    path = lexicon_path()
+    tmp = path.with_suffix(".jsonl.tmp")
     with tmp.open("w", encoding="utf-8", newline="\n") as fh:
         for rec in records:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    os.replace(tmp, LEXICON)
+    os.replace(tmp, path)
 
 
 def profile() -> dict:
@@ -117,21 +166,31 @@ def usable(records: list[dict], through: int | None) -> list[dict]:
     """The words chat and quiz may use: unlocked, and not past the course position.
 
     The course position only gates `exposed`. A word marked shaky or known is evidence
-    the learner produced, and that outranks the marker (same rule as set-unit).
+    the learner produced, and that outranks the marker (same rule as set-unit). So does
+    `seen` -- a connection (Anki) saying the learner has met the card.
     """
     out = [r for r in records if r.get("confidence") in USABLE]
     if through is not None:
-        out = [r for r in out if r.get("confidence") != "exposed" or (r.get("unit") or 0) <= through]
+        out = [r for r in out if r.get("confidence") != "exposed" or r.get("seen")
+               or (r.get("unit") or 0) <= through]
     return out
 
 
 def is_structural(rec: dict) -> bool:
-    """Particles, copula and honorifics: used freely in chat, never quizzed."""
+    """Particles, articles, copula and honorifics: used freely in chat, never quizzed --
+    their glosses are a dump of every English word they ever translate to -- and vocab
+    lists them on one line instead of one per word.
+
+    The plugin's is_content() names them; a short unsplittable word the dictionary tags
+    as a particle or copula counts too (JMdict gives は no particle POS, so the plugin
+    list carries it by hand).
+    """
     word = rec.get("word", "")
-    if word in STRUCTURAL:
+    L = lang()
+    if not L.is_content(word):
         return True
     pos = set(rec.get("pos") or [])
-    return bool(pos & {"prt", "cop"}) and len(word) <= 2 and bool(KANA.match(word))
+    return bool(pos & {"prt", "cop"}) and len(word) <= 2 and not L.tokens(word)
 
 
 def glosses(rec: dict) -> list[str]:
@@ -175,9 +234,18 @@ def gloss_label(rec: dict) -> str:
     return "/".join(distinct_glosses(rec)[:2])[:60] or rec["word"]
 
 
-def jp_label(rec: dict) -> str:
-    kana = rec.get("kana")
-    return f"{rec['word']} [{kana}]" if kana and kana != rec["word"] else rec["word"]
+def reading_of(rec: dict) -> str | None:
+    """The record's reading field, whatever the language calls it (kana / reading)."""
+    return rec.get("kana") or rec.get("reading") or None
+
+
+def word_label(rec: dict) -> str:
+    """The word with its reading, as the plugin shows it: 食べる [たべる]."""
+    reading = lang().reading_label(rec)
+    return f"{rec['word']} [{reading}]" if reading else rec["word"]
+
+
+jp_label = word_label  # the pre-registry name
 
 
 STOPWORDS = frozenset(
@@ -204,7 +272,8 @@ def key_of(rec: dict, counts: dict[str, int]) -> str:
     """What `mark` needs to find this record again: the word, or word[kana] when the
     surface form alone is shared by several records (分 is both ふん and ぶん)."""
     w = rec["word"]
-    return f"{w}[{rec['kana']}]" if counts.get(w, 0) > 1 and rec.get("kana") else w
+    reading = reading_of(rec)
+    return f"{w}[{reading}]" if counts.get(w, 0) > 1 and reading else w
 
 
 def word_counts(records: list[dict]) -> dict[str, int]:
@@ -237,18 +306,21 @@ def schedule(srs: dict | None, level: str, on: str) -> dict | None:
 def resolve(token: str, records: list[dict], usable_ids: set[int] | None = None) -> list[dict]:
     """Find the records a learner-facing token means.
 
-    Tried in order, first tier with a hit wins: exact word, word[kana], kanji form,
-    kana reading, any spelling variant. Within a tier, usable words beat unseen ones,
-    since a session can only have surfaced a word the learner has.
+    Tried in order, first tier with a hit wins: exact word, word[reading], written form
+    (kanji / headword), reading (kana / reading), any spelling variant, and finally the
+    plugin's normalised form (Bonjour -> bonjour). Within a tier, usable words beat
+    unseen ones, since a session can only have surfaced a word the learner has.
     """
     m = re.fullmatch(r"(.+)\[(.+)\]", token)
+    norm = lang().normalise
     tiers = [lambda r: r["word"] == token]
     if m:
-        tiers.append(lambda r: r["word"] == m[1] and r.get("kana") == m[2])
+        tiers.append(lambda r: r["word"] == m[1] and reading_of(r) == m[2])
     tiers += [
-        lambda r: r.get("kanji") == token,
-        lambda r: r.get("kana") == token,
+        lambda r: token in (r.get("kanji"), r.get("headword")),
+        lambda r: token in (r.get("kana"), r.get("reading")),
         lambda r: token in (r.get("variants") or []),
+        lambda r: norm(r["word"]) == norm(token),
     ]
     for test in tiers:
         hits = [r for r in records if test(r)]
@@ -261,8 +333,14 @@ def resolve(token: str, records: list[dict], usable_ids: set[int] | None = None)
     return []
 
 
+def is_listed(rec: dict) -> bool:
+    """On a test list. `jlpt` is the pre-registry name of `listed`."""
+    return bool(rec.get("listed", rec.get("jlpt")))
+
+
 def compact_line(rec: dict, n: int = 3) -> str:
-    reading = f"[{rec['kana']}]" if rec.get("kana") and rec["kana"] != rec["word"] else ""
+    label = lang().reading_label(rec)
+    reading = f"[{label}]" if label else ""
     return f"{rec['word']}{reading} {'/'.join(distinct_glosses(rec)[:n])}".rstrip()
 
 
@@ -278,13 +356,16 @@ def cmd_stats(args) -> None:
             origins[s] = origins.get(s, 0) + 1
     ratings: dict[str, int] = {}
     for r in records:
-        if r.get("rating"):
-            ratings[f"N{r['rating']}"] = ratings.get(f"N{r['rating']}", 0) + 1
+        label = level_label(r.get("rating"))
+        if label:
+            ratings[label] = ratings.get(label, 0) + 1
     chat = usable(records, current_unit(None))
+    names = names_path()
     emit(
         {
+            "language": code(),
             "total": len(records),
-            "names_excluded": sum(1 for _ in NAMES.read_text(encoding="utf-8").splitlines()) if NAMES.exists() else 0,
+            "names_excluded": sum(1 for _ in names.read_text(encoding="utf-8").splitlines()) if names.exists() else 0,
             "by_confidence": by_conf,
             # What chat actually receives -- vocab applies the course position too,
             # so counting every usable word here would overstate it.
@@ -293,9 +374,9 @@ def cmd_stats(args) -> None:
             "due_for_review": sum(1 for r in chat if is_due(r)),
             "scheduled": sum(1 for r in records if isinstance(r.get("srs"), dict)),
             "by_source": origins,
-            "by_rating": {k: ratings.get(k, 0) for k in ("N5", "N4", "N3", "N2", "N1")},
-            "on_test_list": sum(1 for r in records if r.get("jlpt")),
-            "rated_by_inference": sum(1 for r in records if r.get("rating") and not r.get("jlpt")),
+            "by_rating": {k: ratings.get(k, 0) for k in level_order()},
+            "on_test_list": sum(1 for r in records if is_listed(r)),
+            "rated_by_inference": sum(1 for r in records if r.get("rating") and not is_listed(r)),
             "units_in_course": len(units),
             "through_unit": current_unit(None),
         }
@@ -444,7 +525,7 @@ def cmd_review(args) -> None:
             "words": [
                 {
                     "word": key_of(r, counts),
-                    "kana": r.get("kana"),
+                    "kana": reading_of(r),  # the reading, whatever the language calls it
                     "gloss": gloss_label(r),
                     "confidence": r.get("confidence"),
                     "box": r["srs"].get("box"),
@@ -458,21 +539,23 @@ def cmd_review(args) -> None:
 
 
 def cmd_tests(args) -> None:
-    """Exam coverage per level.
+    """Exam coverage per registry level, easiest first, however many levels there are.
 
-    `on_list` counts only words genuinely in a JLPT list -- that is the number that
+    `on_list` counts only words genuinely in a test list -- that is the number that
     means anything for exam readiness. `inferred` counts words graded at this level by
     decomposition or containment, useful for pitching chat but not exam progress.
     """
     records = load()
+    order = level_order()
     report = {}
-    for n in (5, 4, 3, 2, 1):
-        listed = [r for r in records if r.get("rating") == n and r.get("jlpt")]
-        inferred = [r for r in records if r.get("rating") == n and not r.get("jlpt")]
+    for label in order:
+        n = languages.rating_of(label, order)
+        listed = [r for r in records if r.get("rating") == n and is_listed(r)]
+        inferred = [r for r in records if r.get("rating") == n and not is_listed(r)]
         if not listed and not inferred:
             continue
         known = sum(1 for r in listed if r.get("confidence") in USABLE)
-        report[f"N{n}"] = {
+        report[label] = {
             "on_list": len(listed),
             "unlocked": known,
             "percent": round(100 * known / len(listed), 1) if listed else 0.0,
@@ -482,7 +565,9 @@ def cmd_tests(args) -> None:
     for r in records:
         if r.get("rating_source"):
             by_method[r["rating_source"]] = by_method.get(r["rating_source"], 0) + 1
-    emit({"levels": report, "graded_by": by_method})
+    spec = languages.spec(code())
+    emit({"language": code(), "official": bool((spec.get("tests") or {}).get("official")),
+          "levels": report, "graded_by": by_method})
 
 
 def quiz_priority(rec: dict, on: str) -> tuple:
@@ -501,7 +586,7 @@ def cmd_quiz(args) -> None:
     """Build multiple-choice items the quiz skill can put straight into a question.
 
     Distractors come from here rather than from the model: picking them from the same
-    JLPT rating is what makes a wrong answer mean "did not know the word" instead of
+    test rating is what makes a wrong answer mean "did not know the word" instead of
     "had never seen any of these".
     """
     all_records = load()
@@ -531,8 +616,9 @@ def cmd_quiz(args) -> None:
     rng.shuffle(candidates)  # shuffle first so the sort below breaks ties randomly
     candidates.sort(key=lambda r: quiz_priority(r, on))
 
-    label = jp_label if args.direction == "en2jp" else gloss_label
-    prompt_of = gloss_label if args.direction == "en2jp" else jp_label
+    from_english = args.direction in ("en2jp", "en2target")
+    label = word_label if from_english else gloss_label
+    prompt_of = gloss_label if from_english else word_label
     tokens = {id(r): gloss_tokens(r) for r in pool}
 
     items = []
@@ -574,7 +660,7 @@ def cmd_quiz(args) -> None:
                 "answer": answer,
                 "options": options,
                 "confidence": rec.get("confidence"),
-                "rating": f"N{rec['rating']}" if rec.get("rating") else None,
+                "rating": level_label(rec.get("rating")),
                 "due": is_due(rec, on),
             }
         )
@@ -587,9 +673,25 @@ def cmd_look(args) -> None:
     usable_ids = {id(r) for r in records if r.get("confidence") in USABLE}
     out = {}
     for w in args.words:
-        hits = resolve(w, records, usable_ids)
+        hits = [_with_alias(r) for r in resolve(w, records, usable_ids)]
         out[w] = hits[0] if len(hits) == 1 else (hits or None)
     emit(out)
+
+
+def _with_alias(rec: dict) -> dict:
+    """`look` keeps the old `jlpt` key beside `listed` for one release."""
+    if "listed" in rec and "jlpt" not in rec:
+        return {**rec, "jlpt": rec["listed"]}
+    return rec
+
+
+def script_choices() -> list[str]:
+    """The registry's scripts for every language, plus mixed/other/latin."""
+    try:
+        scripts = {s for spec in languages.registry().values() for s in spec.get("scripts", [])}
+    except (OSError, ValueError):
+        scripts = set()
+    return sorted(scripts | {"mixed", "other", "latin"})
 
 
 def main() -> None:
@@ -597,11 +699,11 @@ def main() -> None:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("stats", help="counts by confidence and course coverage").set_defaults(fn=cmd_stats)
-    sub.add_parser("tests", help="coverage against the JLPT lists").set_defaults(fn=cmd_tests)
+    sub.add_parser("tests", help="coverage against the language's test lists").set_defaults(fn=cmd_tests)
 
     v = sub.add_parser("vocab", help="words chat is allowed to use")
     v.add_argument("--through-unit", type=int, help="override the recorded course position")
-    v.add_argument("--script", choices=["hiragana", "katakana", "kanji", "mixed", "other"])
+    v.add_argument("--script", choices=script_choices(), help="only words written in this script")
     v.add_argument("--confidence", choices=LEVELS)
     v.add_argument("--limit", type=int)
     v.add_argument("--compact", action="store_true", help="one line per word, prompt-ready")
@@ -618,7 +720,9 @@ def main() -> None:
 
     q = sub.add_parser("quiz", help="multiple-choice items drawn from the unlocked words")
     q.add_argument("--count", type=int, default=8)
-    q.add_argument("--direction", choices=["jp2en", "en2jp"], default="jp2en")
+    q.add_argument("--direction", choices=["jp2en", "en2jp", "target2en", "en2target"], default="jp2en",
+                   help="jp2en/target2en: word -> English meaning; en2jp/en2target: the reverse. "
+                        "jp* names are kept for the skills and mean the active language")
     q.add_argument("--through-unit", type=int)
     q.add_argument("--only", choices=["due", "shaky", "new"], help="restrict the asked words (distractors still come from everything)")
     q.add_argument("--seed", type=int, help="fix the draw, for testing")

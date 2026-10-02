@@ -39,10 +39,11 @@ class SandboxCase(unittest.TestCase):
         lx.PROFILE.write_text(json.dumps(data), encoding="utf-8")
 
     def write_lexicon(self, records):
-        lx.LEXICON.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records), encoding="utf-8")
+        lx.lexicon_path().parent.mkdir(parents=True, exist_ok=True)
+        lx.lexicon_path().write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records), encoding="utf-8")
 
     def read_lexicon(self):
-        return {r["word"]: r for r in (json.loads(l) for l in lx.LEXICON.read_text(encoding="utf-8").splitlines() if l.strip())}
+        return {r["word"]: r for r in (json.loads(l) for l in lx.lexicon_path().read_text(encoding="utf-8").splitlines() if l.strip())}
 
     def run_cli(self, *argv):
         out = io.StringIO()
@@ -172,10 +173,10 @@ class TestMark(SandboxCase):
         self.assertTrue(lex["食べる"].get("last_seen"))
 
     def test_unknown_level_rejected_without_writing(self):
-        before = lx.LEXICON.read_bytes()
+        before = lx.lexicon_path().read_bytes()
         with self.assertRaises(SystemExit):
             self.run_cli("mark", "食べる", "mastered")
-        self.assertEqual(lx.LEXICON.read_bytes(), before)
+        self.assertEqual(lx.lexicon_path().read_bytes(), before)
 
     def test_missing_word_reported(self):
         out = json.loads(self.run_cli("mark", "存在しない", "known"))

@@ -22,7 +22,7 @@ Run refresh-user-profile.py first, or every unit will read as uncompleted.
 
 Usage:
     python fetch-progress.py            # username from username.txt
-    python fetch-progress.py Jackicuss
+    python fetch-progress.py <username>
 """
 
 from __future__ import annotations
@@ -87,8 +87,15 @@ def main() -> None:
     through = max((u["unit"] for u in done), default=0)
 
     # Which course is this tree? The tab header names the language being learned.
+    # Failing that, the course parse_courses marks active; never a hardcoded language.
     m = re.search(r'<span class="flag (\w+) under"></span><span class="flag m (\w+)"></span>', html)
-    src, dst = (m.group(1), m.group(2)) if m else ("en", "ja")
+    if m:
+        src, dst = m.group(1), m.group(2)
+    else:
+        active = [k for k, c in duome.parse_courses(html).items() if c["active"]]
+        if not active:
+            raise SystemExit("Could not tell which course the tree belongs to -- duome's markup may have changed.")
+        src, dst = active[0].split("-", 1)
     language = duome.lang_name(dst)
 
     progress = {
@@ -121,7 +128,7 @@ def main() -> None:
                 "through_unit": through,
                 "units_completed": len(done),
                 "units_total": len(units),
-                "wordlist": f"data/languages/{duome.lang_name(src)}/{language.lower()}.csv",
+                "wordlist": str(duome.wordlist_path(src, dst).relative_to(duome.SOURCE_ROOT)),
             }
         )
         duome.write_json(duome.PROFILE, profile)

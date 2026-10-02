@@ -1,6 +1,6 @@
 """The grading tiers of build_lexicon.Grader, each pinned to the false positive that earned it.
 
-See CLAUDE.md, "Grading: jlpt and rating are separate". Every fixture here is a hand-built
+See CLAUDE.md, "Grading: jlpt and rating are separate" (`jlpt` is now `listed`). Every fixture here is a hand-built
 miniature of the real JLPT list / JMdict, so a failure points at a rule, not at data drift.
 Some levels are deliberately contrived (月 at N3) so that "hardest part wins" is observable.
 """
@@ -10,9 +10,10 @@ from __future__ import annotations
 import unittest
 
 import _support  # noqa: F401  (path shim)
-from _support import jlpt, jmdict
+from _support import grader, jlpt, jmdict
 
 import build_lexicon as bl
+import languages
 
 LISTED_TIERS = {"expression", "reading", "inflection", "variant"}
 
@@ -58,7 +59,7 @@ class GraderCase(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.grader = bl.Grader(cls.tests)
+        cls.grader = grader(cls.tests)
 
     def grade(self, word, gloss, entry=None):
         return self.grader.grade(word, gloss, entry)
@@ -78,7 +79,7 @@ class TestExpressionAndReading(GraderCase):
         self.assertEqual(self.grade("おちゃ", ["green tea"]), (True, "N5", "reading", "お茶"))
 
     def test_pick_prefers_easiest_level(self):
-        g = bl.Grader([jlpt("N2", "酢", "す", "vinegar"), jlpt("N3", "酢", "す", "vinegar")])
+        g = grader([jlpt("N2", "酢", "す", "vinegar"), jlpt("N3", "酢", "す", "vinegar")])
         self.assertEqual(g.grade("酢", ["vinegar"], None)[1], "N3")
 
 
@@ -94,7 +95,7 @@ class TestInflection(GraderCase):
     def test_shimasu_never_hits_shiru_even_when_suru_unlisted(self):
         """The regular rule turns します into しる. With する absent the irregular table
         must still keep it off 知る rather than fall through to the regular rule."""
-        g = bl.Grader([jlpt("N5", "知る", "しる", "to know")])
+        g = grader([jlpt("N5", "知る", "しる", "to know")])
         self.assertNotEqual(g.grade("します", ["do"], None)[3], "知る")
 
     def test_kimasu_is_kuru(self):
@@ -102,13 +103,13 @@ class TestInflection(GraderCase):
 
     def test_one_char_dictionary_form_rejected(self):
         """し + ましょう reduces (godan) to す, which would hit 酢 "vinegar"."""
-        g = bl.Grader([jlpt("N3", "酢", "す", "vinegar")])
+        g = grader([jlpt("N3", "酢", "す", "vinegar")])
         self.assertEqual(g.grade("しましょう", ["let's do"], None), (False, None, None, None))
-        g = bl.Grader([jlpt("N3", "酢", "す", "vinegar")])
+        g = grader([jlpt("N3", "酢", "す", "vinegar")])
         self.assertNotEqual(g.grade("しませんでした", ["did not do"], None)[3], "酢")
 
     def test_bare_one_char_word_does_not_reduce(self):
-        g = bl.Grader([jlpt("N3", "酢", "す", "vinegar")])
+        g = grader([jlpt("N3", "酢", "す", "vinegar")])
         self.assertNotEqual(g.grade("し", ["four"], None)[3], "酢")
 
     def test_shimashou_is_not_shiru(self):
@@ -218,31 +219,31 @@ class TestContains(GraderCase):
 class TestStem(GraderCase):
     def test_shared_sense_without_shared_stem_rejected(self):
         """Meaning alone pairs わたしの "mine" with 鉱山 "a mine"."""
-        g = bl.Grader([jlpt("N1", "鉱山", "こうざん", "mine")])
+        g = grader([jlpt("N1", "鉱山", "こうざん", "mine")])
         self.assertEqual(g.grade("わたしの", ["my", "mine"], None), (False, None, None, None))
 
     def test_shared_sense_and_stem_accepted(self):
         """つぎの -> 次 via the reading つぎ."""
-        g = bl.Grader([jlpt("N5", "次", "つぎ", "next")])
+        g = grader([jlpt("N5", "次", "つぎ", "next")])
         self.assertEqual(g.grade("つぎの", ["next"], None), (False, "N5", "stem", "次"))
 
     def test_ambiguous_levels_rejected(self):
         """Corroborated candidates at two different levels: no stem grade at all."""
-        g = bl.Grader([jlpt("N5", "次", "つぎ", "next"), jlpt("N3", "継ぎ", "つぎ", "next")])
+        g = grader([jlpt("N5", "次", "つぎ", "next"), jlpt("N3", "継ぎ", "つぎ", "next")])
         self.assertIsNone(g.grade("つぎの", ["next"], None)[1])
 
 
-# ------------------------------------------------------------- jlpt vs rating
+# ----------------------------------------------------------- listed vs rating
 class TestJlptRatingSeparation(GraderCase):
     def test_listed_word(self):
         jlpt_flag, level, _, _ = self.grade("コーヒー", ["coffee"])
         self.assertTrue(jlpt_flag)
-        self.assertEqual(bl.level_num(level), 5)
+        self.assertEqual(languages.rating_of(level, _support.JA_LEVELS), 5)
 
     def test_unlisted_word_still_rated(self):
         jlpt_flag, level, _, _ = self.grade("アイスコーヒー", ["iced coffee"])
         self.assertFalse(jlpt_flag)
-        self.assertEqual(bl.level_num(level), 5)
+        self.assertEqual(languages.rating_of(level, _support.JA_LEVELS), 5)
 
 
 # ------------------------------------------------------------------ dictionary
@@ -254,8 +255,8 @@ class TestBestEntry(unittest.TestCase):
         ])
 
     def test_sense_picks_the_meaning_the_source_gave(self):
-        self.assertEqual(bl.best_entry("本", ["book"], self.index)["kana"], "ほん")
-        self.assertEqual(bl.best_entry("本", ["origin"], self.index)["kana"], "もと")
+        self.assertEqual(bl.best_entry("本", ["book"], self.index)["reading"], "ほん")
+        self.assertEqual(bl.best_entry("本", ["origin"], self.index)["reading"], "もと")
 
     def test_unknown_word(self):
         self.assertIsNone(bl.best_entry("無い", ["none"], self.index))
@@ -291,7 +292,7 @@ class TestLooksLikeName(unittest.TestCase):
 
 class TestRateName(unittest.TestCase):
     def setUp(self):
-        self.grader = bl.Grader([jlpt("N5", "田", "た", "rice field"), jlpt("N2", "鈴", "すず", "bell")])
+        self.grader = grader([jlpt("N5", "田", "た", "rice field"), jlpt("N2", "鈴", "すず", "bell")])
 
     def test_hardest_kanji(self):
         self.assertEqual(self.grader.rate_name("鈴田"), ("N2", "name-kanji"))

@@ -7,8 +7,11 @@ were withdrawn in 2023. Everything here is plain HTTP against public pages.
 
 from __future__ import annotations
 
+import importlib
 import json
 import re
+import sys
+import unicodedata
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -16,9 +19,14 @@ from pathlib import Path
 BASE = "https://duome.eu"
 UA = "Mozilla/5.0 (compatible; Language-Agent/1.0)"
 
-# scripts live at Sources/Duolingo/data/fetch/, so the source root is three up.
+# scripts live at Connections/Duolingo/data/fetch/, so the source root is three up.
 HERE = Path(__file__).resolve().parent
 SOURCE_ROOT = HERE.parent.parent
+PROJECT_ROOT = SOURCE_ROOT.parent.parent
+# The language registry and the per-language plugins are owned by the project, not by
+# this connection; read them, never write them.
+REGISTRY = PROJECT_ROOT / "languages.json"
+PLUGINS = PROJECT_ROOT / "Profile" / "data" / "scripts"
 DATA = SOURCE_ROOT / "data"
 # Word lists are grouped by the language you learn FROM: languages/English/japanese.csv
 LANGUAGES = DATA / "languages"
@@ -44,7 +52,8 @@ MAGIC = {
     b"RIFF": "webp",
 }
 
-# duome uses ISO-ish codes in URLs; we store under readable folder names.
+# duome uses Duolingo's course codes in URLs, which are not always ISO: Mandarin is
+# `zs`, not `zh`. This table is only the fallback for codes the registry does not know.
 LANG_NAMES = {
     "ja": "Japanese", "ko": "Korean", "zs": "Chinese", "en": "English",
     "es": "Spanish", "fr": "French", "de": "German", "it": "Italian",
@@ -67,8 +76,129 @@ ENTITIES = {"&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": '"', "&#039;": "'"
 
 
 def lang_name(code: str) -> str:
-    """Folder name for a language code, falling back to the code itself."""
+    """Readable name for a language code: the registry first, then LANG_NAMES, then the code."""
+    entry = language(code)
+    if entry:
+        return entry["name"]
     return LANG_NAMES.get(code.lower(), code.lower())
+
+
+def registry() -> dict:
+    """languages.json, without its `_doc` key. Empty if the file is missing or unreadable."""
+    try:
+        data = json.loads(REGISTRY.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in data.items() if not k.startswith("_") and isinstance(v, dict)}
+
+
+def language(code: str) -> dict | None:
+    """The registry entry for a course code, with its registry key under "code".
+
+    Accepts either the registry key (`zh`) or duome's course code (`zs`), and finally
+    matches on name, so a registry whose `duolingo` field is stale still resolves.
+    """
+    code = code.lower()
+    reg = registry()
+    for key, entry in reg.items():
+        if str(entry.get("duolingo") or "").lower() == code:
+            return {"code": key, **entry}
+    if code in reg:
+        return {"code": code, **reg[code]}
+    name = LANG_NAMES.get(code)
+    for key, entry in reg.items():
+        if name and entry.get("name") == name:
+            return {"code": key, **entry}
+    return None
+
+
+def duome_code(code: str) -> str:
+    """The course code duome wants in its URLs for a registry key or duome code."""
+    entry = registry().get(code.lower())
+    return str(entry.get("duolingo") or code) if entry else code
+
+
+def wordlist_path(src: str, dst: str) -> Path:
+    """data/languages/<FromName>/<languagename>.csv -- the CONTRACTS section-5 location."""
+    return LANGUAGES / lang_name(src) / f"{lang_name(dst).lower()}.csv"
+
+
+def load_plugin(plugin: str | None):
+    """The language plugin's LANGUAGE object, or None if it is absent or fails to import.
+
+    Plugins live in Profile/data/scripts/languages/ and are owned elsewhere, so a
+    missing or broken one degrades to the generic classifier instead of failing.
+    """
+    if not plugin:
+        return None
+    if not (PLUGINS / "languages" / f"{plugin}.py").exists():
+        return None
+    if str(PLUGINS) not in sys.path:
+        sys.path.insert(0, str(PLUGINS))
+    try:
+        module = importlib.import_module(f"languages.{plugin}")
+    except Exception as exc:  # someone else's code; never let it sink a scrape
+        print(f"  warning: language plugin {plugin!r} failed to import ({exc}); using generic script detection")
+        return None
+    lang = getattr(module, "LANGUAGE", None)
+    return lang if callable(getattr(lang, "script_of", None)) else None
+
+
+# Unicode block -> script label. Only labels the active language's registry lists are
+# ever emitted; CJK ideographs take whichever of kanji/hanzi/hanja that language uses.
+_BLOCKS = (("HIRAGANA", "hiragana"), ("KATAKANA", "katakana"), ("HANGUL", "hangul"), ("LATIN", "latin"))
+_IDEOGRAPH = ("kanji", "hanzi", "hanja")
+
+
+def generic_script(word: str, scripts: list[str] | tuple[str, ...] = ()) -> str:
+    """Fallback script classifier: a registry script if the word uses exactly one, else latin/mixed."""
+    kinds = set()
+    for ch in word:
+        if not ch.isalpha():
+            continue
+        name = unicodedata.name(ch, "")
+        if "IDEOGRAPH" in name:  # CJK unified/compatibility ideographs, and 々
+            kinds.add(next((s for s in _IDEOGRAPH if s in scripts), "ideograph"))
+            continue
+        for block, label in _BLOCKS:
+            if name.startswith(block) or f" {block} " in f" {name} ":
+                kinds.add(label)
+                break
+        else:
+            kinds.add("other")
+    if len(kinds) == 1:
+        kind = kinds.pop()
+        if kind == "latin" or kind in scripts:
+            return kind
+    return "mixed"
+
+
+def script_classifier(code: str):
+    """script_of for a course: the language plugin's if there is one, else the generic one."""
+    entry = language(code) or {}
+    scripts = tuple(entry.get("scripts") or ())
+    plugin = load_plugin(entry.get("plugin"))
+    if plugin is not None:
+        allowed = {*scripts, "latin", "mixed"}
+
+        def classify(word: str) -> str:
+            # CONTRACTS section 5: a registry script, latin or mixed. Anything else the
+            # plugin answers (e.g. "other") goes to the generic classifier instead.
+            try:
+                label = plugin.script_of(word)
+            except Exception:
+                label = None
+            return label if label in allowed else generic_script(word, scripts)
+        return classify, f"plugin {entry.get('plugin')}"
+    return (lambda word: generic_script(word, scripts)), "generic"
+
+
+def active_course() -> tuple[str, str] | None:
+    """(from, to) of the course this account's profile.json marks active, if any."""
+    for course in load_profile().get("courses", {}).values():
+        if course.get("active") and course.get("from_language") and course.get("learning_language"):
+            return course["from_language"], course["learning_language"]
+    return None
 
 
 def username() -> str:

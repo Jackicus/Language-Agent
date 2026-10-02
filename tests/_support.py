@@ -1,4 +1,4 @@
-"""Shared fixtures: path shim, tiny hand-built JLPT and JMdict rows, and sandboxing.
+"""Shared fixtures: path shim, tiny hand-built test-list and dictionary rows, and sandboxing.
 
 Nothing here touches the real Profile/, Connections/ or Resources/ trees. Scripts are
 imported (which only computes path constants) and every Path-valued module global that
@@ -24,18 +24,50 @@ for p in (str(SCRIPTS), str(HERE)):
         sys.path.insert(0, p)
 
 
+TEST_COLUMNS = ["level", "expression", "reading", "meaning", "tags"]
+DICTIONARY_COLUMNS = ["headword", "reading", "forms", "readings", "pos", "senses", "common"]
+JA_LEVELS = ["N5", "N4", "N3", "N2", "N1"]
+CEFR = ["A1", "A2", "B1", "B2", "C1", "C2"]
+
+
 def jlpt(level: str, expression: str, reading: str, meaning: str) -> dict:
-    """One row of Resources/Tests/<lang>/jlpt-nX.csv."""
+    """One row of Resources/Tests/<Language>/<source>-<level>.csv (any language)."""
     return {"level": level, "expression": expression, "reading": reading, "meaning": meaning, "tags": ""}
+
+
+test_row = jlpt
 
 
 def jmdict(kanji: str, kana: str, kanji_all: str | None = None, kana_all: str | None = None,
            pos: str = "n", senses: str = "", common: str = "1") -> dict:
-    """One row of Resources/Dictionary/<lang>/jmdict.csv."""
-    return {"kanji": kanji, "kana": kana,
-            "kanji_all": kanji if kanji_all is None else kanji_all,
-            "kana_all": kana if kana_all is None else kana_all,
+    """One JMdict entry in the generic dictionary schema (CONTRACTS section 3).
+
+    Takes JMdict's own terms -- kanji spelling ("" if kana-only) and kana reading -- and
+    maps them as fetch-jmdict.py does: headword = kanji or kana, forms = kanji spellings.
+    """
+    kanji_all = kanji if kanji_all is None else kanji_all
+    kana_all = kana if kana_all is None else kana_all
+    return {"headword": kanji or kana, "reading": kana, "forms": kanji_all, "readings": kana_all,
             "pos": pos, "senses": senses, "common": common}
+
+
+def entry(headword: str, reading: str = "", forms: str = "", readings: str = "",
+          pos: str = "n", senses: str = "", common: str = "1") -> dict:
+    """One generic dictionary row, for languages other than Japanese."""
+    return {"headword": headword, "reading": reading, "forms": forms, "readings": readings,
+            "pos": pos, "senses": senses, "common": common}
+
+
+def plugin(code: str = "ja"):
+    import languages
+    return languages.plugin(code)
+
+
+def grader(tests: list[dict], code: str = "ja", levels: list[str] | None = None):
+    """build_lexicon.Grader for a registry language (Japanese by default)."""
+    import build_lexicon
+    import languages
+    return build_lexicon.Grader(tests, languages.plugin(code), levels or languages.levels(code))
 
 
 def sandbox(module, tmp: Path) -> ExitStack:

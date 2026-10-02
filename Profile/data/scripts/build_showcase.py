@@ -6,14 +6,17 @@ file:// cannot fetch() sibling files, browsers treat every local read as cross-o
 Baking the data in keeps the page a single self-contained artifact you can double-click,
 with no server and no CORS flags. Images are inlined as data URIs for the same reason.
 
-Reads whatever exists and skips the rest, so it works before any given connection has
-been scraped:
-    Connections/*/profile.json          account facts and course registry
-    Connections/*/profile.png           avatar
-    Connections/*/assets/*.svg          stat icons
-    Connections/*/data/languages/*/*.csv    raw course word tables
-    Connections/Tests/*/*.csv           test vocabulary lists
-    Profile/lexicon.jsonl   the merged lexicon, with confidence
+Shows the active language only -- `language` in Profile/profile.json, labelled from
+languages.json (its name, level names, scripts). Reads whatever exists and skips the
+rest, so it works before any given connection has been scraped:
+    Connections/*/profile.json                      account facts and course registry
+    Connections/*/profile.png                       avatar
+    Connections/*/assets/*.svg                      stat icons
+    Connections/*/data/languages/*/<language>.csv   raw word tables (Duolingo, Anki, ...)
+    Resources/Tests/<Language>/*.csv                test vocabulary lists
+    Profile/<code>/lexicon.jsonl, names.jsonl       the merged lexicon, with confidence
+
+Columns a language has no data for (kanji for French, audio for an Anki deck) are dropped.
 
 Usage:
     python build_showcase.py
@@ -26,17 +29,17 @@ import argparse
 import base64
 import csv
 import json
+import os
 import webbrowser
 from datetime import date
 from pathlib import Path
 
-# scripts live at Profile/data/scripts/, so Profile is three up.
-PROFILE_DIR = Path(__file__).resolve().parents[2]
-ROOT = PROFILE_DIR.parent
+# scripts live at Profile/data/scripts/, so the project root is four up.
+ROOT = Path(__file__).resolve().parents[3]
+# LEXICON_DIR overrides Profile/ as a whole; the <code>/ subfolder still applies under it.
+PROFILE_DIR = Path(os.environ.get("LEXICON_DIR") or ROOT / "Profile")
 CONNECTIONS = ROOT / "Connections"
 RESOURCES = ROOT / "Resources"
-LEXICON = PROFILE_DIR / "lexicon.jsonl"
-NAMES = PROFILE_DIR / "names.jsonl"
 LEARNER = PROFILE_DIR / "profile.json"
 OUT = ROOT / "showcase.html"
 
@@ -52,6 +55,57 @@ def col(label, cls="", type_="text"):
 
 def read_json(path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+
+
+def load_language() -> tuple[str, dict]:
+    """(code, registry entry) for the active language. Accepts the pre-registry form of
+    profile.json, which stored the name ("Japanese") rather than the code."""
+    registry = {k: v for k, v in read_json(ROOT / "languages.json").items() if not k.startswith("_")}
+    value = str(read_json(LEARNER).get("language") or "")
+    for code, entry in registry.items():
+        if value.lower() in (code, entry["name"].lower()):
+            return code, entry
+    code = next(iter(registry), "ja")  # nothing chosen yet: the registry's first language
+    return code, registry.get(code) or {"name": "Japanese", "scripts": [], "tests": {}, "dictionary": {}}
+
+
+CODE, LANG = load_language()
+LEVELS = (LANG.get("tests") or {}).get("levels") or []
+TEST_SOURCE = (LANG.get("tests") or {}).get("source") or ""
+OFFICIAL = bool((LANG.get("tests") or {}).get("official"))
+SCRIPTS = LANG.get("scripts") or []
+
+
+def profile_file(name: str) -> Path:
+    """Profile/<code>/<name>, or the flat pre-registry Profile/<name> until build_lexicon moves it."""
+    path = PROFILE_DIR / CODE / name
+    flat = PROFILE_DIR / name
+    return flat if not path.exists() and CODE == "ja" and flat.exists() else path
+
+
+LEXICON = profile_file("lexicon.jsonl")
+NAMES = profile_file("names.jsonl")
+
+
+def level_label(rating) -> str:
+    """rating = len(levels) - index, so the easiest level has the highest rating."""
+    if not isinstance(rating, int) or not LEVELS or not 1 <= rating <= len(LEVELS):
+        return ""
+    return LEVELS[len(LEVELS) - rating]
+
+
+def prune(dataset: dict, keep: tuple = ()) -> dict:
+    """Drop columns no row fills, remapping the facet/lock/sort indices that point at them."""
+    cols, rows = dataset["columns"], dataset["rows"]
+    live = [i for i in range(len(cols)) if i in keep or any(r[i] not in (None, "") for r in rows)]
+    where = {old: new for new, old in enumerate(live)}
+    dataset["columns"] = [cols[i] for i in live]
+    dataset["rows"] = [[r[i] for i in live] for r in rows]
+    dataset["facets"] = [where[i] for i in dataset.get("facets", []) if i in where]
+    for key in ("lockCol", "sort"):
+        if dataset.get(key) is not None:
+            dataset[key] = where.get(dataset[key], 0 if key == "sort" else None)
+    return dataset
 
 
 def data_uri(path: Path, mime: str) -> str:
@@ -89,13 +143,14 @@ def _word_rows(path: Path) -> list[list]:
             continue
         r = json.loads(line)
         audio = r.get("audio") or ""
+        listed = r["listed"] if "listed" in r else r.get("jlpt")  # `jlpt` is the pre-registry name
         rows.append([
             r["word"],
-            r.get("kana") or "",
+            r.get("kana") or r.get("reading") or "",
             r.get("kanji") or "",
             " / ".join(r.get("gloss") or []),
-            f"N{r['rating']}" if r.get("rating") else "",
-            "listed" if r.get("jlpt") else "inferred",
+            level_label(r.get("rating")),
+            ("listed" if listed else "inferred") if r.get("rating") else "",
             r.get("rating_source") or "",
             r.get("matched") or "",
             r.get("confidence") or "unseen",
@@ -110,13 +165,28 @@ def _word_rows(path: Path) -> list[list]:
 
 
 # Reading order: what the word is, then how hard, then where you are with it, then admin.
+# Japanese keeps its own labels; other languages get neutral ones, and prune() drops
+# whichever of these a language never fills.
 WORD_COLUMNS = [
-    col("Word", "word"), col("Kana", "reading"), col("Kanji", "word"), col("Meaning"),
-    col("Rating", NUM), col("On list", NUM), col("Graded by", NUM), col("Matched", NUM),
+    col("Word", "word"), col("Kana" if "hiragana" in SCRIPTS else "Reading", "reading"),
+    col("Kanji" if "kanji" in SCRIPTS else "Other form", "word"), col("Meaning"),
+    col("Level", NUM), col("On list", NUM), col("Graded by", NUM), col("Matched", NUM),
     col("Status", "status"),
     col("Unit", NUM, "num"), col("Unit name", NUM), col("Source", NUM),
-    col("Script", NUM), col("Rōmaji", "reading"), col("Audio", "", "audio"),
+    col("Script", NUM), col("Rōmaji" if CODE == "ja" else "Romanisation", "reading"), col("Audio", "", "audio"),
 ]
+
+
+def rating_note() -> str:
+    if not LEVELS:
+        return ""
+    if TEST_SOURCE and OFFICIAL:
+        where = f"a real {TEST_SOURCE.upper()} entry"
+    elif TEST_SOURCE:
+        where = "a frequency band (an approximation, not an exam list)"
+    else:
+        where = "a test list -- none is fetched for this language yet, so every level is inferred"
+    return f" Level is difficulty ({LEVELS[0]} easiest); “On list” says whether it came from {where} or was inferred."
 
 
 def lexicon_dataset() -> dict | None:
@@ -124,19 +194,17 @@ def lexicon_dataset() -> dict | None:
         return None
     rows = _word_rows(LEXICON)
     rows.sort(key=lambda r: (r[9] if r[9] is not None else 10**6, r[0]))
-    return {
+    return prune({
         "id": "lexicon",
         "connection": "Profile",
-        "title": "Lexicon",
-        "note": "Every word the connections and resources contribute, deduplicated. "
-                "Rating is difficulty (N5 easiest); “On list” says whether that came from a "
-                "real JLPT entry or was inferred.",
+        "title": f"{LANG['name']} Lexicon",
+        "note": "Every word the connections and resources contribute, deduplicated." + rating_note(),
         "columns": WORD_COLUMNS,
         "facets": [4, 5, 6, 8, 11],
         "lockCol": 8,
         "sort": 9,          # course order reads better than alphabetical
         "rows": rows,
-    }
+    }, keep=(0, 8))
 
 
 def names_dataset() -> dict | None:
@@ -146,7 +214,7 @@ def names_dataset() -> dict | None:
     if not rows:
         return None
     rows.sort(key=lambda r: (r[9] if r[9] is not None else 10**6, r[0]))
-    return {
+    return prune({
         "id": "names",
         "connection": "Profile",
         "title": "Names",
@@ -157,15 +225,15 @@ def names_dataset() -> dict | None:
         "lockCol": 8,
         "sort": 9,
         "rows": rows,
-    }
+    }, keep=(0, 8))
 
 
 def wordlist_datasets() -> list[dict]:
-    """Raw course tables, one dataset per connection/language CSV."""
+    """Raw word tables for the active language, one dataset per connection."""
     datasets = []
-    for path in sorted(CONNECTIONS.glob("*/data/languages/*/*.csv")):
+    for path in sorted(CONNECTIONS.glob(f"*/data/languages/*/{LANG['name'].lower()}.csv")):
         connection = path.relative_to(CONNECTIONS).parts[0]
-        language = path.stem.capitalize()
+        language = LANG["name"]
         with path.open(encoding="utf-8-sig", newline="") as fh:
             raw = list(csv.DictReader(fh))
         rows = []
@@ -179,59 +247,65 @@ def wordlist_datasets() -> list[dict]:
                 r.get("reading") or "",
                 (r.get("gloss") or "").replace("|", " / "),
                 r.get("script") or "",
+                {"1": "seen", "0": "not yet"}.get(r.get("seen") or "", ""),
                 audio[len(AUDIO_PREFIX):] if audio.startswith(AUDIO_PREFIX) else audio,
             ])
-        datasets.append({
+        units = any(r[0] is not None for r in rows)
+        datasets.append(prune({
             "id": f"{connection.lower()}-{language.lower()}",
             "connection": connection,
             "title": f"{connection} {language} Wordlist",
-            "note": "Every word the course teaches, in course order. Unit is where it is first introduced.",
+            "note": "Every word the course teaches, in course order. Unit is where it is first introduced."
+                    if units else "Every card in the deck. “Seen” means reviewed at least once.",
             "columns": [
                 col("Unit", NUM, "num"), col("Unit name", NUM), col("Topic", NUM),
                 col("Word", "word"), col("Reading", "reading"), col("Meaning"),
-                col("Script", NUM), col("Audio", "", "audio"),
+                col("Script", NUM), col("Seen", NUM), col("Audio", "", "audio"),
             ],
-            "facets": [6],
+            "facets": [6, 7],
             "lockCol": None,
             "rows": rows,
-        })
+        }, keep=(3,)))
     return datasets
 
 
 def test_datasets() -> list[dict]:
-    """Test vocabulary lists, e.g. Resources/Tests/Japanese/jlpt-n5.csv."""
+    """Test vocabulary lists for the active language, e.g. Resources/Tests/Japanese/jlpt-n5.csv."""
     datasets = []
-    tests = RESOURCES / "Tests"
-    for path in sorted(tests.glob("*/*.csv")) if tests.exists() else []:
-        language = path.parent.name
+    folder = RESOURCES / "Tests" / LANG["name"]
+    for path in sorted(folder.glob("*.csv")) if folder.exists() else []:
         with path.open(encoding="utf-8-sig", newline="") as fh:
             raw = list(csv.DictReader(fh))
         if not raw:
             continue
-        level = (raw[0].get("level") or path.stem).upper()
+        level = raw[0].get("level") or path.stem
         rows = [[r.get("expression", ""), r.get("reading", ""), r.get("meaning", ""), r.get("tags", "")] for r in raw]
-        datasets.append({
+        source = path.stem.split("-")[0].upper()
+        # "Japanese JLPT N5", but "Chinese HSK1" rather than "Chinese HSK HSK1".
+        named = level if level.upper().startswith(source) or not OFFICIAL else f"{source} {level}"
+        datasets.append(prune({
             "id": f"tests-{path.stem}",
             "connection": "Tests",
-            "title": f"{language} {level.replace('N', 'JLPT N')}" if level.startswith("N") else f"{language} {level}",
-            "note": f"{len(rows):,} words expected at this level.",
+            "title": f"{LANG['name']} {named}",
+            "note": f"{len(rows):,} words expected at this level." if OFFICIAL else
+                    f"{len(rows):,} words in this frequency band -- an approximation, not an exam list.",
             "columns": [col("Expression", "word"), col("Reading", "reading"), col("Meaning"), col("Tags", NUM)],
             "facets": [],
             "lockCol": None,
             "rows": rows,
-        })
-    # N5 (easiest) first rather than alphabetical, which would give N1 first.
-    order = {f"tests-jlpt-n{n}": i for i, n in enumerate([5, 4, 3, 2, 1])}
-    datasets.sort(key=lambda d: order.get(d["id"], 99))
+        }, keep=(0,)))
+    # Easiest level first, in the registry's order, rather than alphabetical (N1 first).
+    order = {lv.upper(): i for i, lv in enumerate(LEVELS)}
+    datasets.sort(key=lambda d: order.get(d["title"].rsplit(" ", 1)[-1].upper(), 99))
     return datasets
 
 
 PAGE = """<!doctype html>
-<html lang="en">
+<html lang="__CODE__">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Language-Agent — Showcase</title>
+<title>Language-Agent — __LANGUAGE__</title>
 <style>
 :root {
   --bg: #f5f6f8; --panel: #ffffff; --sunk: #f0f2f5; --ink: #14181f; --muted: #6b7280;
@@ -397,6 +471,7 @@ const AUDIO_PREFIX = "__AUDIO_PREFIX__";
 const CONN_NOTES = {
   Profile: "Yours. The merged word store everything else feeds, plus your own evidence.",
   Duolingo: "Your account — course vocabulary and unit progress, scraped from duome.eu.",
+  Anki: "Your deck — every card, and which ones you have already reviewed.",
   Tests: "Reference. Standardised exam vocabulary, for measuring coverage against a syllabus.",
 };
 
@@ -522,7 +597,7 @@ function render() {
     const x = a[sortCol], y = b[sortCol];
     if (x == null) return 1;
     if (y == null) return -1;
-    const cmp = ds.columns[sortCol].type === "num" ? x - y : String(x).localeCompare(String(y), "ja");
+    const cmp = ds.columns[sortCol].type === "num" ? x - y : String(x).localeCompare(String(y), DATA.lang);
     return cmp * sortDir;
   });
 
@@ -542,7 +617,8 @@ const player = new Audio();
 el("rows").addEventListener("click", e => {
   const btn = e.target.closest(".play[data-a]");
   if (!btn) return;
-  player.src = AUDIO_PREFIX + btn.dataset.a;
+  const a = btn.dataset.a;  // stripped of AUDIO_PREFIX when it had it; other hosts stay whole
+  player.src = /^https?:/.test(a) ? a : AUDIO_PREFIX + a;
   player.play().catch(() => { btn.textContent = "×"; btn.title = "Could not play — are you offline?"; });
 });
 
@@ -567,18 +643,21 @@ def main() -> None:
     learner = read_json(LEARNER)
 
     counts = learner.get("lexicon", {})
-    subtitle = f"Generated {date.today().isoformat()}"
+    subtitle = f"{LANG['name']} · generated {date.today().isoformat()}"
     if counts:
         subtitle += f" · {counts.get('usable', 0):,} of {counts.get('total', 0):,} words unlocked"
 
-    payload = json.dumps({"profiles": profiles, "datasets": datasets}, ensure_ascii=False, separators=(",", ":"))
+    payload = json.dumps({"lang": CODE, "profiles": profiles, "datasets": datasets},
+                         ensure_ascii=False, separators=(",", ":"))
     page = (
-        PAGE.replace("__DATA__", payload)
+        PAGE.replace("__LANGUAGE__", LANG["name"]).replace("__CODE__", CODE)
+        .replace("__DATA__", payload)
         .replace("__AUDIO_PREFIX__", AUDIO_PREFIX)
         .replace("__SUBTITLE__", subtitle)
     )
     OUT.write_text(page, encoding="utf-8")
 
+    print(f"language: {LANG['name']} ({CODE})")
     print(f"profiles: {len(profiles)} ({', '.join(p['connection'] for p in profiles) or 'none'})")
     for d in datasets:
         print(f"  {d['connection']:<10} {d['title']:<34} {len(d['rows']):>6,} rows")

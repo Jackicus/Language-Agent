@@ -25,7 +25,10 @@ python setup.py --check
 ```
 
 If it exits non-zero, the lexicon is missing or not usable yet. Tell the learner to type
-`/setup` and stop.
+`/setup` (or `/sync`, if the output suggests `python setup.py --sync`) and stop.
+
+The first line names the language: `language: French (fr)`. Use that name wherever this
+skill says "the language".
 
 ## 1. Pull the items
 
@@ -35,17 +38,18 @@ python lexicon.py quiz --count 8
 ```
 
 Add `--direction en2jp` if the learner asks to be tested the other way (English prompt,
-Japanese options). That direction is harder — it tests production, not recognition.
+options in the language; `python lexicon.py quiz -h` shows the flag's current spelling).
+That direction is harder — it tests production, not recognition.
 
 Items come back already prioritised: words the review schedule says are due, then
 `shaky`, then the least-tested `exposed`, with `known` only filling the round. If the
 learner asks for a narrower round, add `--only due`, `--only shaky` or `--only new`
 (never-tested words). `python lexicon.py review --compact` shows what is due, if they ask.
-Particles and the copula are never quizzed.
+The language's structural words (particles, articles, the copula) are never quizzed.
 
 Each item comes back with `prompt`, `options` (already shuffled), `answer`, and `word`.
-**Do not invent options or reorder them.** The distractors are drawn from the same JLPT
-rating on purpose; substituting your own turns "did they know this word" into "did they
+**Do not invent options or reorder them.** The distractors are drawn from the same
+difficulty level on purpose; substituting your own turns "did they know this word" into "did they
 recognise any of these".
 
 If `items` is empty, report the error it returns and stop.
@@ -54,9 +58,10 @@ If `items` is empty, report the error it returns and stop.
 
 Use `AskUserQuestion`, up to 4 items per call — so a default round of 8 is two calls.
 
-- `question` — the item's `prompt`, phrased as a question: `What does 食べる [たべる] mean?`
-  (for `en2jp`: `Which word means "to eat"?`)
-- `header` — a short tag, e.g. the item's `rating` (`N5`) or `Word 3`
+- `question` — the item's `prompt`, phrased as a question, with the reading in brackets
+  when the item has one: `What does 食べる [たべる] mean?`, `What does maison mean?`
+  (for the reverse direction: `Which word means "to eat"?`)
+- `header` — a short tag, e.g. the item's level (`N5`, `HSK2`, `A1`) or `Word 3`
 - `options` — the item's `options`, in the order given, one per option `label`
 - `description` — keep it neutral (`—`). Anything written here is a hint.
 - `multiSelect` — always `false`
@@ -80,8 +85,9 @@ One call, at the end, never mid-round:
 python Profile/data/scripts/lexicon.py mark 食べる known そうです shaky
 ```
 
-Use each item's `word` exactly. Where two records share a spelling it comes as
-`word[reading]` (`分[ふん]`) — quote those, since the shell treats brackets as a glob.
+(Japanese examples; use the round's own words.) Use each item's `word` exactly. Where two
+records share a spelling it comes as `word[reading]` (`分[ふん]`) — quote those, since the
+shell treats brackets as a glob.
 If the output lists anything under `not_in_lexicon` or `ambiguous`, say so; everything
 else was written in that one call. `known` and `shaky` also reschedule the word for
 review, so the next round brings back what was missed.

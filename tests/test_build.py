@@ -22,15 +22,17 @@ import _support
 from _support import jlpt, jmdict
 
 import build_lexicon as bl
+import languages
 
 COURSE_COLUMNS = ["unit", "unit_name", "unit_topic", "position", "word", "reading", "gloss",
-                  "script", "repeat_units", "audio"]
+                  "script", "repeat_units", "audio", "seen"]
 
 
-def course_row(unit, word, gloss, reading="", repeat=""):
+def course_row(unit, word, gloss, reading="", repeat="", seen=""):
     return {"unit": unit, "unit_name": f"Unit {unit}", "unit_topic": "topic", "position": 1,
-            "word": word, "reading": reading, "gloss": gloss, "script": bl.script_of(word),
-            "repeat_units": repeat, "audio": ""}
+            "word": word, "reading": reading, "gloss": gloss,
+            "script": languages.plugin("ja").script_of(word),
+            "repeat_units": repeat, "audio": "", "seen": seen}
 
 
 COURSE = [
@@ -117,7 +119,8 @@ class BuildCase(unittest.TestCase):
             write_csv(self.root / "Resources" / "Tests" / "Japanese" / name,
                       ["level", "expression", "reading", "meaning", "tags"], rows)
         write_csv(self.root / "Resources" / "Dictionary" / "Japanese" / "jmdict.csv",
-                  ["kanji", "kana", "kanji_all", "kana_all", "pos", "senses", "common"], DICTIONARY)
+                  _support.DICTIONARY_COLUMNS, DICTIONARY)
+        # The pre-registry flat layout: every build here also exercises the move to ja/.
         write_jsonl(self.root / "Profile" / "lexicon.jsonl", self.prior_lexicon)
         write_jsonl(self.root / "Profile" / "names.jsonl", self.prior_names)
 
@@ -128,8 +131,8 @@ class BuildCase(unittest.TestCase):
     def build(self, *argv):
         with mock.patch.object(sys, "argv", ["build_lexicon.py", *argv]), redirect_stdout(io.StringIO()):
             bl.main()
-        self.lexicon = read_jsonl(bl.LEXICON)
-        self.names = read_jsonl(bl.NAMES)
+        self.lexicon = read_jsonl(bl.lexicon_path("ja"))
+        self.names = read_jsonl(bl.names_path("ja"))
         return self.lexicon
 
 
@@ -146,7 +149,7 @@ class TestLearnerEvidenceSurvives(BuildCase):
         rec = self.build()["たべます"]
         self.assertEqual(rec["gloss"], ["eat", "eats"])
         self.assertEqual(rec["unit"], 1)
-        self.assertEqual((rec["jlpt"], rec["rating"], rec["rating_source"]), (True, 5, "inflection"))
+        self.assertEqual((rec["listed"], rec["rating"], rec["rating_source"]), (True, 5, "inflection"))
 
     def test_survives_two_rebuilds(self):
         self.build()
@@ -195,15 +198,16 @@ class TestMerge(BuildCase):
         self.assertEqual(sorted(lex["おちゃ"]["sources"]), ["duolingo", "tests"])
         self.assertEqual(lex["おちゃ"]["kanji"], "お茶")
 
-    def test_jlpt_and_rating_separate(self):
+    def test_listed_and_rating_separate(self):
         lex = self.build()
-        self.assertEqual((lex["コーヒー"]["jlpt"], lex["コーヒー"]["rating"]), (True, 5))
-        self.assertEqual((lex["アイスコーヒー"]["jlpt"], lex["アイスコーヒー"]["rating"],
+        self.assertEqual((lex["コーヒー"]["listed"], lex["コーヒー"]["rating"]), (True, 5))
+        self.assertNotIn("jlpt", lex["コーヒー"])
+        self.assertEqual((lex["アイスコーヒー"]["listed"], lex["アイスコーヒー"]["rating"],
                           lex["アイスコーヒー"]["rating_source"]), (False, 5, "contains"))
 
     def test_course_position_is_last_resort(self):
         rec = self.build()["ピザ"]
-        self.assertEqual((rec["jlpt"], rec["rating"], rec["rating_source"]), (False, 5, "course-position"))
+        self.assertEqual((rec["listed"], rec["rating"], rec["rating_source"]), (False, 5, "course-position"))
 
     def test_names_split_out(self):
         self.build()
@@ -211,10 +215,12 @@ class TestMerge(BuildCase):
         self.assertEqual(self.names["たなか"]["rating_source"], "name-kana")
 
     def test_dry_run_writes_nothing(self):
-        before = bl.LEXICON.read_bytes()
+        flat = bl.PROFILE_DIR / "lexicon.jsonl"
+        before = flat.read_bytes()
         with mock.patch.object(sys, "argv", ["build_lexicon.py", "--dry-run"]), redirect_stdout(io.StringIO()):
             bl.main()
-        self.assertEqual(bl.LEXICON.read_bytes(), before)
+        self.assertEqual(flat.read_bytes(), before)        # not even migrated
+        self.assertFalse(bl.lexicon_path("ja").parent.exists())
         self.assertFalse(bl.PROFILE.exists())
 
     def test_profile_mirrors_course_position(self):

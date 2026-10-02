@@ -26,8 +26,10 @@ Usage:
 from __future__ import annotations
 
 import csv
+import http.client
 import io
 import sys
+import urllib.error
 import urllib.request
 from pathlib import Path
 
@@ -88,4 +90,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # CONTRACTS §4: a network failure is one line and a non-zero exit, not a traceback.
+    try:
+        main()
+    except urllib.error.HTTPError as exc:
+        sys.exit(f"error: HTTP {exc.code} fetching {exc.url}")
+    except (urllib.error.URLError, http.client.HTTPException, TimeoutError, ConnectionError) as exc:
+        sys.exit(f"error: network failure: {getattr(exc, 'reason', None) or exc}")

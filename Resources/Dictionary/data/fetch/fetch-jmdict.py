@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Fetch a Japanese dictionary table from JMdict into Connections/Dictionary/Japanese/.
+"""Fetch a Japanese dictionary table from JMdict into Resources/Dictionary/Japanese/.
 
 Why this connection exists: Duolingo gives a surface form and an English gloss, and for
 kanji-only entries (東京, 京都, 私) it gives no reading at all. That leaves the lexicon
@@ -14,13 +14,14 @@ Uses the "common" subset of jmdict-simplified (~1.4 MB compressed, ~30k entries)
 than the full 200k-entry file. The full file is mostly rare and archaic vocabulary that
 no beginner course will ever surface, and it would triple the lexicon build time.
 
-Output: Japanese/jmdict.csv
+Output: Japanese/jmdict.csv, in the generic dictionary schema every language shares
+(CONTRACTS.md section 3):
 
-    kanji     primary kanji spelling ("" if the word is kana-only)
-    kana      primary kana reading
-    kanji_all all kanji spellings, pipe-separated
-    kana_all  all kana readings, pipe-separated
-    pos       parts of speech, pipe-separated
+    headword  primary kanji spelling, or the kana reading if the word is kana-only
+    reading   primary kana reading
+    forms     all kanji spellings, pipe-separated ("" if kana-only)
+    readings  all kana readings, pipe-separated
+    pos       parts of speech, pipe-separated (JMdict short tags: n, v1, adj-i, prt ...)
     senses    English glosses, pipe-separated
     common    1 if JMdict marks the word common
 
@@ -35,6 +36,7 @@ import argparse
 import csv
 import io
 import json
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -43,13 +45,17 @@ RELEASES = "https://api.github.com/repos/scriptin/jmdict-simplified/releases/lat
 HERE = Path(__file__).resolve().parent
 CONNECTION_ROOT = HERE.parent.parent
 OUT_DIR = CONNECTION_ROOT / "Japanese"
-COLUMNS = ["kanji", "kana", "kanji_all", "kana_all", "pos", "senses", "common"]
+COLUMNS = ["headword", "reading", "forms", "readings", "pos", "senses", "common"]
 
 
 def get(url: str) -> bytes:
     req = urllib.request.Request(url, headers={"User-Agent": "Language-Agent/1.0"})
-    with urllib.request.urlopen(req, timeout=180) as resp:
-        return resp.read()
+    try:
+        with urllib.request.urlopen(req, timeout=180) as resp:
+            return resp.read()
+    except (urllib.error.URLError, OSError) as exc:  # HTTPError is a URLError
+        # One line, no traceback: setup.py reports network failures by this message.
+        raise SystemExit(f"could not reach GitHub ({getattr(exc, 'reason', exc)}): {url}")
 
 
 def find_asset(full: bool) -> tuple[str, str]:
@@ -96,10 +102,10 @@ def main() -> None:
             senses += [g["text"] for g in sense.get("gloss", []) if g.get("lang") == "eng"]
         common = any(k.get("common") for k in word.get("kanji", [])) or any(k.get("common") for k in word.get("kana", []))
         rows.append({
-            "kanji": kanji[0] if kanji else "",
-            "kana": kana[0],
-            "kanji_all": "|".join(dict.fromkeys(kanji)),
-            "kana_all": "|".join(dict.fromkeys(kana)),
+            "headword": kanji[0] if kanji else kana[0],
+            "reading": kana[0],
+            "forms": "|".join(dict.fromkeys(kanji)),
+            "readings": "|".join(dict.fromkeys(kana)),
             "pos": "|".join(dict.fromkeys(pos)),
             "senses": "|".join(dict.fromkeys(senses)),
             "common": "1" if common else "0",
@@ -112,7 +118,7 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(rows)
 
-    with_kanji = sum(1 for r in rows if r["kanji"])
+    with_kanji = sum(1 for r in rows if r["forms"])
     print(f"  {len(rows):,} entries ({with_kanji:,} with a kanji spelling)")
     print(f"  version {data.get('version')} · dict date {data.get('dictDate')}")
     print(f"wrote {out.relative_to(CONNECTION_ROOT.parent.parent)} ({out.stat().st_size / 1024 / 1024:.1f} MB)")
