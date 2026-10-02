@@ -1,0 +1,28 @@
+# Personal identifiers and scraped account data — never commit.
+# Note this must NOT cover Connections/*/data/fetch/ or /scripts/, which are code.
+Connections/*/username.txt
+Connections/*/profile.json
+Connections/*/profile.png
+Connections/*/progress.json
+Connections/*/assets/
+Connections/*/data/languages/
+
+# Fetched reference data — regenerable, so not worth committing
+Resources/*/Japanese/
+Resources/*/*/*.csv
+
+# Learner state is personal; keep it local — but Profile/data/scripts/ is code.
+Profile/lexicon.jsonl
+Profile/names.jsonl
+Profile/profile.json
+Chats/*
+!Chats/.gitkeep
+
+# Cloned prior art, not part of this project
+_references/
+
+# Generated view — rebuild it with build_showcase.py
+showcase.html
+
+__pycache__/
+*.pyc
